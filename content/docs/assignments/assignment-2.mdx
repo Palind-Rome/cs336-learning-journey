@@ -101,6 +101,21 @@ leaderboard 的长上下文、大词表、两 B200 完整 step 同时受 attenti
 
 ## 测试与阅读入口
 
+### `tests/adapters.py` 完整契约表
+
+| Adapter | 契约重点 |
+|---|---|
+| `get_flashattention_autograd_function_pytorch` | 返回 `torch.autograd.Function` 类；tiled forward 保存 LSE/Q/K/V/O，backward 返回含 causal 的匹配项数 |
+| `get_flashattention_autograd_function_triton` | Triton forward 支持 causal/non-causal；FP32 online state，输出/梯度与 oracle 在容差内 |
+| `get_ddp` | wrapper 暴露 `.module`；init broadcast、tied/frozen 参数安全 |
+| `ddp_on_after_backward` | 调用最终同步屏障，等待所有 async all-reduce handle |
+| `get_sharded_optimizer` | owner 稳定、local optimizer state、step 后参数广播、动态 param group |
+| `get_fsdp` | Linear/Embedding shard；`compute_dtype` 可选，FP32 master 与 replicated norm 正确 |
+| `fsdp_on_after_backward` | 完成 reduce-scatter/all-reduce 和异步等待 |
+| `fsdp_gather_full_params` | 临时重建原名/原 shape 的 full state，不改变 shard 训练状态 |
+
+这些入口的返回类型和调用时机比 PDF 中的自然语言更精确；先让 adapter 只做连接，再在独立模块实现系统逻辑。
+
 - [A2 官方仓库](https://github.com/stanford-cs336/assignment2-systems)
 - [`test_attention.py`](https://github.com/stanford-cs336/assignment2-systems/blob/main/tests/test_attention.py)
 - [`test_ddp.py`](https://github.com/stanford-cs336/assignment2-systems/blob/main/tests/test_ddp.py)

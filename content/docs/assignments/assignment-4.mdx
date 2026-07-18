@@ -49,6 +49,22 @@ P(成为候选 | 相似度 s) = 1 − (1 − s^r)^b
 
 `tests/adapters.py` 是 11 个入口。语言需映射 `en/zh`；mask 字符串为 `|||EMAIL_ADDRESS|||`、`|||PHONE_NUMBER|||`、`|||IP_ADDRESS|||`；harmful 标签使用 `nsfw/non-nsfw` 与 `toxic/non-toxic`；质量标签为 `wiki/cc`。去重测试检查输出文件数量与指定 license 的簇关系。
 
+| Adapter | 输入/输出与检查重点 |
+|---|---|
+| `run_extract_text_from_html_bytes` | HTML bytes → 正文字符串；与固定抽取文本逐字一致 |
+| `run_identify_language` | text → `(language, positive_score)`；至少正确映射英文和简中 |
+| `run_mask_emails` | text → `(masked_text, count)`；已有 mask 不重复计数 |
+| `run_mask_phone_numbers` | 覆盖题面四种美国电话格式，同时分析误报 |
+| `run_mask_ips` | 合法 IPv4 mask，octet 范围不能只靠 `\d+` |
+| `run_classify_nsfw` | text → `nsfw/non-nsfw` 与 score |
+| `run_classify_toxic_speech` | text → `toxic/non-toxic` 与 score |
+| `run_classify_quality` | text → `wiki/cc` 与 score；注意负采样域泄漏 |
+| `run_gopher_quality_filter` | text → bool；严格实现四条必做规则 |
+| `run_exact_line_deduplication` | input dir → output dir；全局两遍、保留同名文件 |
+| `run_minhash_deduplication` | 文档目录 → 去重目录；规范化、LSH 候选、相似度验证、簇 |
+
+每个 adapter 对应一个可以单测的纯函数边界；完整流水线再负责顺序、批处理、统计和审计样本。
+
 证据入口：[A4 仓库](https://github.com/stanford-cs336/assignment4-data)、[`wet_files.py`](https://github.com/stanford-cs336/assignment4-data/blob/main/cs336_data/wet_files.py)、[Common Crawl 格式](https://commoncrawl.org/blog/navigating-the-warc-file-format)、[Resiliparse](https://resiliparse.chatnoir.eu/en/stable/)。
 
 <Accordions>

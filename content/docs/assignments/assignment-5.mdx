@@ -62,6 +62,25 @@ prompt/response 分开 tokenize、不加特殊 token，拼接后：`input_ids=co
 
 `checkpoint.py` 加载 bfloat16 模型；`vllm_utils.py` 让训练模型与 vLLM 分占 GPU，通过 NCCL 同步权重，更新后清 prefix cache；`prompts/` 保存当前主线模板。先读数据/奖励/测试，再读 vLLM 系统层，避免把生成服务 bug 当 RL 公式 bug。
 
+## `tests/adapters.py` 完整契约表
+
+| Adapter | 关键不变量 |
+|---|---|
+| `run_tokenize_prompt_and_output` | 分开 tokenize 后拼接；input/label shift；response mask 与 label 对齐 |
+| `run_get_response_log_probs` | 按 labels gather `[B,S]` log-prob；可选完整分布 entropy |
+| `run_compute_rollout_rewards` | response/ground truth → total、format、correctness；保持 batch 顺序 |
+| `run_compute_group_normalized_rewards` | 按同 prompt 分组；GRPO/constant/Dr.GRPO/RFT/MaxRL 五种配置 |
+| `run_compute_policy_gradient_loss` | per-token 负目标；on/off-policy ratio 与 clip 方向正确 |
+| `run_aggregate_loss_across_microbatch` | sequence 或 fixed constant；mask 与 microbatch scaling 正确 |
+| `run_grpo_train_step` | gradient accumulation、clip、step、最终清 grad |
+| `run_iterate_batches` | 数据批次可复现，处理最后不足 batch 的约定 |
+| `get_packed_sft_dataset` | 可选补充：连续拼接、EOS、固定长度 input/labels |
+| `run_parse_mmlu_response` | 可选补充：抽取合法 A/B/C/D，否则 `None` |
+| `run_parse_gsm8k_response` | 可选补充：按题面规则抽最后数字，否则 `None` |
+| `run_compute_per_instance_dpo_loss` | 可选补充：chosen/rejected policy/ref log-ratio 与 β，逐实例 loss |
+
+测试不仅比较 scalar loss，还比较一步参数快照，因此“公式看起来等价”不够；normalizer、样本标准差、microbatch 权重和负号都必须与契约一致。
+
 ## 可选 Safety RLHF 补充
 
 补充 PDF 单独覆盖 Llama 3.1 8B 的 MMLU/GSM8K/AlpacaEval/Safety baseline、packed SFT、HH preference data 与 DPO。它不是主作业必做。DPO 比较 policy 相对 frozen reference 对 chosen/rejected 的 response log-prob 差；prompt、EOS、mask 和跨 device loss 都是重点。

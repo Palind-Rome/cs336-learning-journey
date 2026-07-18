@@ -112,6 +112,30 @@ uv run pytest tests/test_train_bpe.py -k speed -v
 
 ## 证据与延伸
 
+### `tests/adapters.py` 完整契约表
+
+| Adapter | 你应连接的实现 | 最小验收 |
+|---|---|---|
+| `run_train_bpe` | BPE trainer | vocab bytes、merge 顺序、特殊 token、速度 |
+| `get_tokenizer` | Tokenizer 构造器 | encode/decode/iterable/GPT-2 fixture |
+| `run_linear`, `run_embedding` | 无 bias Linear、查表 Embedding | 任意 leading dims 与权重方向 |
+| `run_rmsnorm`, `run_silu`, `run_swiglu` | norm、激活、门控 FFN | FP32 内部 norm、三矩阵 shape |
+| `run_softmax` | 指定 dim 稳定 softmax | 加大常数后不变、概率和为 1 |
+| `run_scaled_dot_product_attention` | 可广播 mask 的 SDPA | 3D/4D、Q/K 长度、key 轴 softmax |
+| `run_rope` | 显式 position 的 RoPE | position 0、范数、非连续 position |
+| `run_multihead_self_attention` | 无 RoPE MHA | 拆/并头、causal mask |
+| `run_multihead_self_attention_with_rope` | Q/K 旋转的 MHA | V 不旋转、head dim 正确 |
+| `run_transformer_block` | pre-norm block | 两条 residual 路径与 state keys |
+| `run_transformer_lm` | 完整 decoder LM | 截短 S、最终 norm、`[B,S,V]` |
+| `run_cross_entropy` | 稳定平均 CE | 极大 logits 不溢出 |
+| `get_adamw_cls` | `Optimizer` 子类 | moment、bias correction、解耦 decay |
+| `run_get_lr_cosine_schedule` | warmup+cosine+floor | 四个边界值 |
+| `run_gradient_clipping` | 全局 L2 clip | frozen/None grad、共同缩放 |
+| `run_get_batch` | 相邻 token batch | 起点边界、device、memmap |
+| `run_save_checkpoint`, `run_load_checkpoint` | 可恢复状态 | 路径/file-like、模型/optimizer/iteration |
+
+Adapter 只负责把你的类/函数接到测试参数，算法实现应放在自己的 `cs336_basics` 模块；不要把逻辑全塞进测试胶水。
+
 - [A1 官方仓库](https://github.com/stanford-cs336/assignment1-basics)
 - [`tests/adapters.py`](https://github.com/stanford-cs336/assignment1-basics/blob/main/tests/adapters.py)：接口契约
 - [`tests/test_model.py`](https://github.com/stanford-cs336/assignment1-basics/blob/main/tests/test_model.py)：模型快照
