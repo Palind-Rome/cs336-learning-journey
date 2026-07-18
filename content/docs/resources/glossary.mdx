@@ -1,0 +1,73 @@
+---
+title: 小白术语表
+description: 遇到陌生词先在这里建立一句话心智模型。
+---
+
+## 模型与训练
+
+- **Token**：tokenizer 词表中的一个整数单位，可能是字节、字符、子词或标点串。
+- **Logit**：softmax 前的任意实数分数；差值决定相对概率。
+- **Cross-entropy / NLL**：正确 token 负对数概率的平均。
+- **Perplexity (PPL)**：`exp(NLL)`；可直觉看成每步有效候选数，但不可跨 tokenizer 随意比较。
+- **Embedding**：整数 id 到稠密向量的查表矩阵。
+- **Residual stream**：贯穿 Transformer blocks 的主向量流，各子层把更新加回它。
+- **Pre-norm**：先 norm 再进子层，输出与原 residual 相加。
+- **RMSNorm**：按最后一维均方根缩放，不减均值。
+- **RoPE**：按位置旋转 Q/K，让点积含相对位置信息。
+- **SwiGLU**：SiLU 门控的两支路 FFN。
+- **Causal mask**：阻止位置 i 看到未来 j>i。
+- **Teacher forcing**：训练时一次输入真实前缀并并行预测每个下一 token。
+- **Checkpoint**：模型、优化器、step 等可恢复训练状态；不同于 activation checkpointing。
+- **Ablation**：只移除/替换一个设计，观察因果影响。
+
+## 系统
+
+- **Kernel**：GPU 上一次启动执行的函数。
+- **HBM**：GPU 大容量高带宽显存，离计算单元仍比 SRAM/寄存器远。
+- **FLOP**：一次浮点运算；矩阵乘通常把乘和加各算一次。
+- **Arithmetic intensity**：每搬一字节做多少 FLOPs。
+- **Roofline**：用计算峰值与内存带宽上限判断瓶颈。
+- **MFU**：实际训练计算吞吐相对理论峰值。
+- **Kernel fusion**：合并算子，减少中间张量读写和启动开销。
+- **Tiling**：把大矩阵切成能在片上存储复用的小块。
+- **Warp**：GPU 一组锁步执行的线程；分支不一致会浪费。
+- **All-reduce**：各 rank 共同规约并让每个 rank 获得结果。
+- **All-gather**：每个 rank 收集所有 rank 的 shard。
+- **Reduce-scatter**：先规约，再把结果分片给不同 rank。
+- **DDP**：每卡完整模型、分数据、同步平均梯度。
+- **FSDP / ZeRO-3**：模型状态分片，计算时临时 gather 所需参数。
+- **KV cache**：推理保存历史 key/value，避免每个新 token 重算历史。
+- **Prefill / Decode**：处理完整 prompt / 逐个生成后续 token。
+
+## 数据与规模
+
+- **Scaling law**：loss 与参数、数据、计算的经验幂律关系。
+- **IsoFLOP**：固定计算预算，扫描不同模型大小/数据量。
+- **Compute-optimal**：给定预算使 loss 最低的 N/D 配比，不等于推理最便宜。
+- **μP**：让宽度变化时激活/更新尺度稳定的参数化，用于超参迁移。
+- **WARC/WAT/WET**：Common Crawl 的原始响应 / 元数据 / 抽取文本格式。
+- **Jaccard**：两集合交集大小除以并集大小。
+- **MinHash**：用签名碰撞率估计 Jaccard。
+- **LSH**：让相似签名更可能落同桶，只比较候选而非全体两两比较。
+- **Data contamination**：训练集含评测题/答案，使评测虚高。
+- **Data mixture**：多个数据域的采样配比。
+
+## 对齐与 RL
+
+- **SFT**：在示范回答上做监督式 next-token 训练。
+- **Preference data**：同一 prompt 的 chosen/rejected 回答比较。
+- **Policy**：给定前缀的下一个 token 分布，也就是语言模型。
+- **Reward**：对完整或部分轨迹的标量评价。
+- **Advantage**：相对 baseline“比预期好多少”的学习信号。
+- **On-policy**：训练数据由当前或非常接近当前的策略采样。
+- **Off-policy**：使用旧策略/其他策略产生的数据，需要校正分布差异。
+- **Importance ratio**：新策略概率除以行为策略概率。
+- **PPO clipping**：限制 ratio 对目标的影响，降低大更新风险。
+- **GRPO**：同 prompt 多回答组内比较，不训练单独 value critic。
+- **DPO**：直接从 preference pair 优化 policy 相对 reference 的 log-prob 差。
+- **KL regularization**：惩罚策略偏离 reference，控制行为漂移。
+- **RLVR**：用答案检查器、编译器等可验证信号做 RL。
+
+<Callout type="info" title="记术语的最好方式">
+  每个词都写成“输入是什么 → 做什么 → 输出什么 → 花什么资源”。例如 all-reduce：每卡一个梯度 shard → 求和/平均 → 每卡相同结果 → 花网络带宽与同步时间。
+</Callout>

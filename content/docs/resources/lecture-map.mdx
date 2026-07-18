@@ -1,0 +1,40 @@
+---
+title: 17 讲课程地图
+description: Spring 2026 每讲的主题、本站落点、作业连接与原始材料。
+---
+
+课程的 17 份讲义中，01/02/06/07/10/12/13/14/17 是可执行 Python 讲义，03/04/05/08/09/11/15/16 是 PDF。可执行讲义把叙述、代码和引用放在同一程序中，阅读时从 `main()` 看章节树，再跳到具体函数。
+
+| 讲 | 核心问题 | 本站落点 | 作业/原始材料 |
+|---:|---|---|---|
+| 01 | Unicode、bytes、BPE、压缩率 | [Tokenization](/docs/foundations/tokenization) | A1 · [lecture_01.py](https://github.com/stanford-cs336/lectures/blob/main/lecture_01.py) |
+| 02 | tensor、FLOPs、内存、roofline | [必要先修](/docs/foundations/prerequisites) | A1/A2 · [lecture_02.py](https://github.com/stanford-cs336/lectures/blob/main/lecture_02.py) |
+| 03 | RMSNorm、SwiGLU、RoPE、GQA | [Transformer](/docs/foundations/transformer) | A1 · [课程官网材料](https://cs336.stanford.edu/) |
+| 04 | 线性 attention、Mamba、MoE | 本页下方扩展 | 架构扩展 · 官网 PDF |
+| 05 | GPU、存储层次、FlashAttention | [GPU 与 Kernel](/docs/systems/gpu-kernels) | A2 · 官网 PDF |
+| 06 | benchmark、profile、Triton | [GPU 与 Kernel](/docs/systems/gpu-kernels) | A2 · [lecture_06.py](https://github.com/stanford-cs336/lectures/blob/main/lecture_06.py) |
+| 07 | collective、DP/TP/PP | [并行训练](/docs/systems/distributed-inference) | A2 · [lecture_07.py](https://github.com/stanford-cs336/lectures/blob/main/lecture_07.py) |
+| 08 | ZeRO/FSDP、3D/4D parallel | [并行训练](/docs/systems/distributed-inference) | A2 · 官网 PDF |
+| 09 | 幂律、Chinchilla、compute-optimal | [Scaling Laws](/docs/scaling/laws) | A3 · 官网 PDF |
+| 10 | prefill/decode、KV cache、vLLM | [高效推理](/docs/systems/distributed-inference) | A2/A5 · [lecture_10.py](https://github.com/stanford-cs336/lectures/blob/main/lecture_10.py) |
+| 11 | μP、WSD、工业缩放 recipe | [Scaling Laws](/docs/scaling/laws) | A3 · 官网 PDF |
+| 12 | PPL、MMLU、Arena、污染 | [评测专题](/docs/resources/evaluation-multimodal) | A4/A5 · [lecture_12.py](https://github.com/stanford-cs336/lectures/blob/main/lecture_12.py) |
+| 13 | Common Crawl、Pile、Dolma、DCLM | [数据流水线](/docs/data/pipeline) | A4 · [lecture_13.py](https://github.com/stanford-cs336/lectures/blob/main/lecture_13.py) |
+| 14 | filter、MinHash、mix、synthetic | [数据流水线](/docs/data/pipeline) | A4 · [lecture_14.py](https://github.com/stanford-cs336/lectures/blob/main/lecture_14.py) |
+| 15 | SFT、RLHF、DPO | [后训练](/docs/alignment/post-training) | A5 补充 · 官网 PDF |
+| 16 | PPO、GRPO、RLVR、R1 | [后训练](/docs/alignment/post-training) | A5 · 官网 PDF |
+| 17 | CLIP、LLaVA、Qwen-VL、VQ-VAE | [多模态扩展](/docs/resources/evaluation-multimodal) | 扩展 · [lecture_17.py](https://github.com/stanford-cs336/lectures/blob/main/lecture_17.py) |
+
+## Lecture 4 的架构岔路
+
+标准 softmax attention 需要 `T×T` 交互。线性 attention 尝试用结合律 `Q(KᵀV)` 或递推状态降低长序列成本；Mamba/DeltaNet 引入可选择更新的状态；混合架构保留少量 full attention 补足精确检索。
+
+MoE 则沿另一维扩展：每个 token 只路由到 Top-K 专家，使总参数量大而每 token FLOPs 较小。代价是离散路由训练、负载均衡、all-to-all 通信和容量管理。dense Transformer 是理解这些方案的基线；先问“省了什么资源，又把复杂度移到哪里”。
+
+## Lecture 11 的实战补丁
+
+μP（Maximal Update Parametrization）试图让不同宽度模型的激活与更新保持合适尺度，从小模型迁移学习率等超参；WSD（warmup-stable-decay）让多个实验共享稳定训练段，再分叉不同 decay，节约缩放实验。但 norm gain、weight decay、优化器与架构变化会破坏理想迁移，必须用 pilot 验证。
+
+<Callout type="info" title="版本提示">
+  课程录像可能来自 Spring 2025，而本站与课程地图以本地 Spring 2026 讲义为主。遇到主题或作业配置不同，先看 2026 题面与测试。
+</Callout>

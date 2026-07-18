@@ -1,0 +1,75 @@
+---
+title: Assignment 5 · Alignment & Reasoning RL
+description: 用 OLMo-2-1B 与 GSM8K 完成 prompting、on/off-policy GRPO 及多种 estimator 对比。
+---
+
+## 先把语言模型翻译成 RL
+
+prompt 是初始状态，生成 token 是 action，完整 response 是 trajectory，模型是 policy，数学答案检查器给 terminal reward。当前主作业使用 `allenai/OLMo-2-0425-1B`、GSM8K 和 `r1_zero` prompt；从 baseline 到 GRPO、Dr.GRPO、RFT、MaxRL，再到 off-policy GRPO 与 GSPO。
+
+## 第一阶段：Prompt baseline
+
+比较 `question_only`、zero-shot `r1_zero`、three-shot。不要只记 accuracy：分开统计格式正确且答案正确、格式正确但答案错、二者都错、parser 误判。`drgrpo_grader.py` 要求 `</think><answer>…</answer>` 结构，total reward 只取 correctness，但另记 format 指标。
+
+## 第二阶段：按依赖顺序实现 GRPO
+
+### 1. Token 对齐
+
+prompt/response 分开 tokenize、不加特殊 token，拼接后：`input_ids=concat[:-1]`，`labels=concat[1:]`。`response_mask` 与 labels 对齐，只标 response 的预测位置；padding 为 False。这是最常见 off-by-one。
+
+### 2. Log-prob 与 entropy
+
+对 logits `log_softmax` 后按 labels gather，返回 `[batch,seq]`；entropy 是整个词表分布的 `−Σp log p`，不是已选 token 的负 log-prob。
+
+### 3. Group advantage
+
+同一 prompt 采样 G 个回答。标准 GRPO：`(r−group_mean)/(group_std+eps)`。当前测试按 `torch.std` 默认样本标准差；两个 reward `[1,0]` 得 advantage 约 `±0.7071`，不是 `±1`。
+
+### 4. Loss 与训练步
+
+只在 response mask 上计算负 policy-gradient objective。`sequence` normalizer 先每条回答平均再跨回答平均；`constant` 把有效 token loss 求和后除固定常数，不能再按 microbatch 二次平均。gradient accumulation 期间不能清梯度；最终 clip、step、清梯度，测试要求所有 `.grad is None`。
+
+## 第三阶段：比较 estimator
+
+| 方法 | baseline | advantage normalizer | loss normalizer |
+|---|---|---|---|
+| GRPO | group mean | group std | sequence |
+| GRPO constant | group mean | group std | constant |
+| Dr. GRPO | group mean | 无 | constant |
+| RFT | 无 | 无 | constant |
+| MaxRL | group mean | group mean | constant |
+
+主实验默认 group size 8、rollout 256 responses、200 rollout steps、lr `1e-5`、max tokens 512、4 seeds。先做约 50 steps sanity check，再做多 seed；RL 方差意味着一次胜负不是结论。
+
+## 第四阶段：off-policy 与 GSPO
+
+完整 sequence importance ratio 是 token ratio 的乘积，长序列方差爆炸。token-level PPO/GRPO 用 `exp(logπ_new−logπ_old)` 并 clip；GSPO 对 response token 的 log-ratio 取平均再 exponentiate，相当于 sequence 几何平均，并使用更小 clip range。
+
+旧 log-prob 必须和 rollout token/顺序完全对齐，并在无梯度下保存。所有 ratio 在 log 空间计算；prompt/padding 不参与。每批 rollout 可做多次小 batch 更新，但策略离 behavior policy 越远，估计偏差越大。
+
+<AssignmentStepper items={[
+  '三种 prompt baseline 与 parser 误差已分类',
+  'token/label/response mask 用玩具例手算对齐',
+  'log-prob、entropy、group normalization 快照通过',
+  'sequence/constant 两种 aggregation 通过',
+  'gradient accumulation 后参数快照一致',
+  'on-policy 50-step sanity check 无 NaN',
+  '所有主比较至少 4 seeds 并报告方差',
+  'off-policy old/new log-prob 顺序严格一致'
+]} />
+
+## 生成系统源码导读
+
+`checkpoint.py` 加载 bfloat16 模型；`vllm_utils.py` 让训练模型与 vLLM 分占 GPU，通过 NCCL 同步权重，更新后清 prefix cache；`prompts/` 保存当前主线模板。先读数据/奖励/测试，再读 vLLM 系统层，避免把生成服务 bug 当 RL 公式 bug。
+
+## 可选 Safety RLHF 补充
+
+补充 PDF 单独覆盖 Llama 3.1 8B 的 MMLU/GSM8K/AlpacaEval/Safety baseline、packed SFT、HH preference data 与 DPO。它不是主作业必做。DPO 比较 policy 相对 frozen reference 对 chosen/rejected 的 response log-prob 差；prompt、EOS、mask 和跨 device loss 都是重点。
+
+证据入口：[A5 仓库](https://github.com/stanford-cs336/assignment5-alignment)、[`test_grpo.py`](https://github.com/stanford-cs336/assignment5-alignment/blob/main/tests/test_grpo.py)、[`drgrpo_grader.py`](https://github.com/stanford-cs336/assignment5-alignment/blob/main/cs336_alignment/drgrpo_grader.py)、[`vllm_utils.py`](https://github.com/stanford-cs336/assignment5-alignment/blob/main/cs336_alignment/vllm_utils.py)。
+
+<Accordions>
+  <Accordion title="Reward 正常但模型越来越差">检查 loss 负号、response mask、gradient ascent/下降方向，以及生成策略与实际更新模型是否同步。</Accordion>
+  <Accordion title="换 microbatch 后结果变化">检查 sequence loss 的 batch 权重、constant normalizer 是否被二次平均、zero-advantage pruning 是否改变固定分母。</Accordion>
+  <Accordion title="Off-policy ratio 爆炸">确认在 log 空间算、只覆盖 response、old policy 对齐；再观察策略漂移并使用题面 clip，而不是直接 clamp log-prob 掩盖问题。</Accordion>
+</Accordions>

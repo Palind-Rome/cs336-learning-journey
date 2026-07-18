@@ -1,0 +1,38 @@
+---
+title: 评测与多模态扩展
+description: Lecture 12 与 17：如何测量模型，以及语言模型如何看见图像。
+---
+
+## 评测先定义“好”
+
+Perplexity `PPL=exp(mean NLL)` 衡量模型给测试文本的概率；只有 tokenizer 和文本处理一致时才可横比。能力 benchmark（MMLU/GPQA/GSM8K）、人类/LLM 偏好（Arena/AlpacaEval）、代理任务（SWE-bench）测的是不同构念。
+
+任何结果至少标注：prompt、few-shot、解码参数、parser、模型 checkpoint、数据版本、样本数与置信区间。评测集污染会把记忆当能力；LLM-as-judge 有位置、长度、自我偏好和风格偏差。
+
+```text
+模型输出 → parser → task score
+              ↘ parser failure rate
+pairwise 输出 → judge prompt/model → win rate + 不确定性
+```
+
+Assignment 5 把 format reward、correctness 和最终 reward 分开记录，正是为了不让 parser/格式问题伪装成推理能力问题。
+
+## 从语言 token 到视觉 token
+
+ViT 把图像切 patch，线性投影成序列。**CLIP** 用图文 batch 的对比学习，让配对图文相似、错配远离；**SigLIP** 把 batch softmax 多分类改为 pairwise sigmoid，降低对全局 batch 的依赖。
+
+**LLaVA** 典型做法是预训练 vision encoder + projector + LLM：先对齐视觉特征与词嵌入，再用多模态指令数据 SFT。AnyRes/dynamic resolution 允许不同图像尺寸，但视觉 token 数上升会直接吃掉上下文和 attention 预算。
+
+Qwen2-VL 等用二维/时间扩展的 RoPE 表示空间与视频；DeepStack 把不同层视觉特征注入 LLM。另一条路线如 Chameleon/VQ-VAE 把图像压成离散 codebook id，使同一自回归模型既理解又生成图像。
+
+## 把 CS336 主线迁移过去
+
+- tokenizer → 图像 patch/codebook；
+- 数据工程 → 图文匹配、OCR、去重与安全；
+- 系统 → 视觉 token 更长、动态 shape 与 KV cache；
+- 对齐 → 多模态指令 SFT、偏好与可验证任务奖励；
+- 评测 → 视觉问答、OCR、空间推理，同时排查训练图泄漏。
+
+必读：[CLIP](https://arxiv.org/abs/2103.00020)、[SigLIP](https://arxiv.org/abs/2303.15343)、[LLaVA](https://arxiv.org/abs/2304.08485)、[LLaVA-OneVision](https://arxiv.org/abs/2408.03326)、[Qwen2-VL](https://arxiv.org/abs/2409.12191)、[VQ-VAE](https://arxiv.org/abs/1711.00937)。
+
+<CheckpointQuiz question="把图片分辨率翻倍，视觉 token 一定只翻倍吗？" options={['是', '不一定；若高宽都翻倍、patch 大小不变，token 约变四倍', 'token 与分辨率无关', '一定变八倍'] } answer={1} explanation="patch 数约为 (H/P)×(W/P)；两个空间维都翻倍会让 token 数四倍，full attention 成本甚至约十六倍。" />

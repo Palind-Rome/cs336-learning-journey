@@ -1,0 +1,51 @@
+---
+title: 零号站：必要先修
+description: 用最少的线代、概率和 PyTorch，建立语言建模的共同语言。
+---
+
+## 语言模型到底在学什么？
+
+给定 token 序列 `x₁, x₂, …, xₜ`，自回归语言模型输出下一个 token 的条件分布 `p(xₜ₊₁ | x≤t)`。链式法则把整段文本的概率拆成每一步条件概率的乘积。训练时最大化正确 token 的概率，等价于最小化平均**负对数似然**，在分类语境里就是交叉熵。
+
+如果正确 token 的概率是 `0.5`，损失约为 `−ln 0.5 = 0.693`；若只有 `0.01`，损失是 `4.605`。对数把连乘变成求和，也猛烈惩罚“自信但错误”。
+
+## 四个轴先刻进脑中
+
+课程里最常见的激活张量是 `[B, T, D]`：
+
+- `B`（batch）：同时处理多少条序列；
+- `T`（sequence/time）：每条序列多少 token；
+- `D`（model/channel）：每个 token 用多少维向量表示；
+- attention 拆头后增加 `H`，成为 `[B, H, T, D/H]`。
+
+矩阵乘法只在共享维度上求和。例如 `[B,T,D] @ [D,F] → [B,T,F]`。`einsum` 把轴名写进表达式：`btd,df->btf`。
+
+<TensorShapeLab />
+
+## 导数与反向传播，只需一个心智模型
+
+计算图由局部函数连接。反向传播从 loss 的 `1` 出发，用链式法则把“输出变化对输入的影响”逐层相乘。参数梯度不是参数应该变成的值，而是“参数微小增加时，loss 增加多快”。梯度下降沿负方向更新。
+
+## PyTorch 最容易混淆的三件事
+
+1. **shape 与 layout 不同**：`transpose` 改视图后可能不连续，`view` 前需理解 strides；`reshape` 必要时会复制。
+2. **参数与普通 Tensor 不同**：`nn.Parameter` 会被模块注册，出现在 `state_dict` 与优化器中。
+3. **训练/评测模式不同**：`model.train()` 与 `model.eval()` 影响 dropout 等层；推理还应使用 `torch.no_grad()` 或 `inference_mode()`。
+
+<Callout type="warn" title="数值稳定性">
+  不要直接计算 `log(softmax(x))`；应使用 `log_softmax` / `cross_entropy`。稳定 softmax 会先减去最大 logit，数学结果不变，却避免指数溢出。
+</Callout>
+
+## 资源会贯穿整门课
+
+- **FLOPs**：浮点运算次数；估算“要算多少”。
+- **HBM**：GPU 高带宽显存；参数、激活、梯度、优化器状态都住在这里。
+- **带宽**：每秒搬多少字节；算得少、搬得多的算子通常 memory-bound。
+- **算术强度**：FLOPs / 搬运字节数；用 roofline 判断受计算还是带宽限制。
+- **MFU**：实测训练吞吐相对硬件理论峰值，衡量端到端利用率。
+
+## 建议补读
+
+- [PyTorch Tensor Views](https://docs.pytorch.org/docs/stable/tensor_view.html)：官方解释 strides、view 与 contiguous。
+- [The Matrix Calculus You Need For Deep Learning](https://arxiv.org/abs/1802.01528)：只读与你实现相关的向量/矩阵求导部分。
+- [CS336 lecture 2 源码](https://github.com/stanford-cs336/lectures/blob/main/lecture_02.py)：课程如何用 `einsum`、FLOPs 和内存核算连接数学与系统。

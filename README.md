@@ -1,47 +1,31 @@
-# cs336-learning-journey
+# CS336 · 从零造语言模型
 
-This is a Next.js application generated with
-[Create Fumadocs](https://github.com/fuma-nama/fumadocs).
+面向 LLM 初学者的 Stanford CS336 Spring 2026 中文交互学习网站。内容结合课程 17 讲、5 次作业题面、测试与源码，覆盖 tokenizer、Transformer、GPU/分布式、缩放律、数据工程、评测和后训练。
 
-It is a Next.js app with [Static Export](https://nextjs.org/docs/app/guides/static-exports) configured.
+> 本项目是独立学习教程，不是 Stanford 官方翻译或作业答案仓库。作业内容采用接口契约、推导、测试驱动提示和实验方法，引导读者自行实现。
 
-Run development server:
+## 本地运行
 
 ```bash
+npm install
 npm run dev
-# or
-pnpm dev
-# or
-yarn dev
 ```
 
-Open http://localhost:3000 with your browser to see the result.
+打开 <http://localhost:3000>。静态构建：
 
-## Explore
+```bash
+npm run build
+```
 
-In the project, you can see:
+## 内容结构
 
-- `lib/source.ts`: Code for content source adapter, [`loader()`](https://fumadocs.dev/docs/headless/source-api) provides the interface to access your content.
-- `lib/layout.shared.tsx`: Shared options for layouts, optional but preferred to keep.
+- `content/docs/lectures/`：17 讲精读，按主题分为五组。
+- `content/docs/assignments/`：五次作业测试驱动工坊。
+- `content/docs/foundations|systems|scaling|data|alignment/`：按知识依赖组织的主教程。
+- `src/components/learning-labs.tsx`：张量形状、预算估算、理解检查和进度组件。
 
-| Route                     | Description                                            |
-| ------------------------- | ------------------------------------------------------ |
-| `app/(home)`              | The route group for your landing page and other pages. |
-| `app/docs`                | The documentation layout and pages.                    |
-| `app/api/search/route.ts` | The Route Handler for search.                          |
+## 部署
 
-### Fumadocs MDX
+构建会静态导出到 `out/`。`.github/workflows/deploy.yml` 在 main 分支更新时构建并部署 GitHub Pages；仓库名会自动作为 `basePath`。
 
-A `source.config.ts` config file has been included, you can customise different options like frontmatter schema.
-
-Read the [Introduction](https://fumadocs.dev/docs/mdx) for further details.
-
-## Learn More
-
-To learn more about Next.js and Fumadocs, take a look at the following
-resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js
-  features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-- [Fumadocs](https://fumadocs.dev) - learn about Fumadocs
+课程原始材料：[CS336 官网](https://cs336.stanford.edu/) · [Stanford CS336 GitHub](https://github.com/stanford-cs336) · [Fumadocs](https://fumadocs.dev)

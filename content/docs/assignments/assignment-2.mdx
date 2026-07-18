@@ -1,0 +1,115 @@
+---
+title: Assignment 2 · Systems
+description: 从可信 benchmark 到 FlashAttention、DDP、状态分片与教学版 FSDP。
+---
+
+## 先建立原则
+
+A2 不是“让代码看起来更底层”，而是用证据回答：瓶颈是计算、内存还是通信？优化是否保持数值正确？课程附带的 `cs336-basics/` 是本作业 profiling/FSDP 使用的参考模型，不是让你回填 A1 的答案。
+
+## 第一站：可信 benchmark 与 profile
+
+脚本要支持 forward、forward+backward、完整 optimizer step；先 warmup，再测多次均值/标准差。CUDA 异步，计时边界必须同步。Nsight 用 NVTX 标出 forward/backward/attention，memory snapshot 区分参数、激活、梯度和 optimizer state。
+
+```text
+错误：start=time(); model(x); end=time()   # 多半只测到 enqueue
+正确：warmup → synchronize → event/time → work → synchronize → record
+```
+
+activation checkpoint 保存块边界、反向重算内部。checkpoint 越细，保存边界多；越粗，单次重算时活跃张量多。先画 lifetime，再在 xl/batch 4/seq 2048 实测题面要求的候选，不预设哪个最优。
+
+## 第二站：FlashAttention-2
+
+### 普通 oracle
+
+先写/复用普通 SDPA 和 `logsumexp` 作为小矩阵参考，再做 tiled PyTorch forward，最后转 Triton。每个 Triton program 负责一个 batch 与 query tile，只循环 key tiles。
+
+在线状态：`m`（行最大）、`l`（分母）、`O`（未归一累积），都用 FP32；新最大值出现时，用 `exp(m_old−m_new)` 重缩放旧 `l/O`。最终 `L=m+log(l)` 保存给 backward。
+
+```text
+Qi: [Bq,d]   Kj,Vj: [Bk,d]
+Sij: [Bq,Bk] m,l,L: [Bq]  Oi: [Bq,d]
+```
+
+causal 判断用全局 query/key index。当前实际 adapter 名为 `get_flashattention_autograd_function_triton`；以代码签名为准。
+
+Backward 依据 `P=exp(S−L)` 重算概率，再推 `dV=PᵀdO`、`D=rowsum(O⊙dO)`、`dS=P⊙(dP−D)`、`dQ/dK`。返回项数要与 forward 参数一致，布尔 `is_causal` 对应 `None`。
+
+<AssignmentStepper items={[
+  '普通 attention 小矩阵 oracle 正确',
+  'tiled PyTorch forward 与 LSE 正确',
+  'Triton non-causal 通过',
+  'Triton causal 与边界 tile 通过',
+  'backward 梯度在容差内',
+  'BF16/FP32、不同 S/d 的真实 benchmark 已记录'
+]} />
+
+## 第三站：DDP，从同步到重叠
+
+naive DDP：初始化 broadcast rank 0 参数；各 rank 处理不同数据；backward 后对非空梯度 all-reduce 并除 world size。测试还含 frozen 参数和 tied weights，按 Parameter 身份去重。
+
+优化版用 `register_post_accumulate_grad_hook` 在梯度真正就绪后发起异步 all-reduce；`finish_gradient_synchronization()` 统一 wait，optimizer step 绝不能越过这个屏障。对比逐参数、flatten 一次、异步重叠三种实现，用 timeline 证明而不是凭感觉。
+
+## 第四站：Optimizer state sharding
+
+每个 rank 只让底层 AdamW 持有一部分 Parameter 的 moment；step 后由 owner broadcast 更新参数，使各模型副本重新一致。稳定 owner 规则、参数顺序、tied parameter、空 shard、`add_param_group` 和父/子 optimizer 状态接口都是测试重点。
+
+这相当于 ZeRO-1 的教学内核：参数和梯度仍复制，只有 optimizer state 约按 world size 分片。
+
+## 第五站：教学版 FSDP
+
+只分片 Linear/Embedding 大参数；FP32 master shard 常驻。forward 前 all-gather 完整权重（可转 compute dtype），算完释放；backward 再 gather，梯度 ready 后 reduce-scatter。Norm 等复制小参数的梯度仍需 all-reduce。
+
+必须维护两种“形状世界”：优化器看到 shard `param.data/grad`；计算临时看到 full weight。非整除 shard 要 padding，gather 后裁剪；mixed precision 下 master/optimizer 仍 FP32。`fsdp_gather_full_params` 临时重建原 shape 和原参数名，不能破坏训练状态。
+
+## 最后才做并行策略推导
+
+在 FFN 上先填写每一步 local tensor shape，再数计算与通信：DP 分 batch；TP 切 hidden 维并对 activation collective；FSDP 在权重轴分片并反复 gather；2D FSDP×TP 在两条设备轴平衡通信。能重叠时取关键路径的 max，不能重叠时才相加。
+
+## 题面逐项工作台
+
+### Profiling 与精度
+
+- `benchmarking_script`：覆盖题面 small/medium/large/xl/10B 配置，forward、forward+backward、optimizer step，warmup w 次、测 n 次均值/标准差。
+- `nsys_profile`：用 NVTX 排除 warmup，分别归因 attention/forward/backward；比较 Python 计时和 GPU kernel summary。
+- `mixed_precision_accumulation`：用逐次加小数展示低精度舍入；区分低精度存储、Tensor Core 乘法与 FP32 accumulator。
+- `memory_profiling`：用 memory history/snapshot 找 forward/backward/optimizer 峰值，手算 residual 与 saved tensors 对照。BF16 autocast 不等于所有参数/梯度永久 BF16。
+- `gradient_checkpointing`：先推 checkpoint 边界与重算树，再在指定 xl、batch 4、seq 2048 实测不同 block size；题面限制“一轮重算”时不得悄悄使用无限递归。
+
+### Attention 全题链
+
+`pytorch_attention` 扫 batch 8、d∈{16,32,64,128}、sequence 256→16384，记录 forward/backward/OOM；`torch_compile` 同 shape 比 compiled/uncompiled。`flash_forward` 先 tiled PyTorch 再 Triton，保存唯一 `[B,Q]` LSE；`flash_backward` 按题面公式返回 Q/K/V 梯度和 `None` causal；`flash_benchmarking` 再扫 sequence 到 65536、BF16/FP32、forward/backward/e2e。任何 OOM/速度都是本机实测，不写成普遍常数。
+
+### Distributed 全题链
+
+| 小题 | 实质 | 验收证据 |
+|---|---|---|
+| communication single node | 1MB→1GB、2/4/6 GPU NCCL collective | warmup、同步、各 rank 时间 |
+| naive DDP | init broadcast + backward 后平均 all-reduce | 与全 batch 单进程、tied/frozen 等价 |
+| flat DDP | flatten 一次 collective | latency 与额外 copy 的实测 |
+| overlap DDP | post-accumulate hook + async handle | Nsight 显示通信与 backward 重叠 |
+| state sharding | owner rank 更新 Adam state、广播参数 | 10 steps 与 baseline 对齐 |
+| FSDP | Linear/Embedding shard、两次 gather、grad reduce-scatter | FP32/mixed precision、full params 与 baseline |
+
+### 书面并行推导怎么做
+
+`alternate_ring_all_reduce` 先画每一步“谁持有哪个 chunk”，分别数 latency step 与每设备传输 bytes；不要把整 tensor 环传与 reduce-scatter+all-gather 混成一个公式。
+
+`data_parallel_calcs / fsdp_calcs / tp_calcs / fsdp_tp_calcs` 都从同一个 SwiGLU FFN 开始：为输入、W1/W2/W3、中间激活、dX、dW 写每设备 shape；用矩阵 FLOPs 除设备算力得 compute time，用 collective bytes/带宽加 latency 得 communication time。DP 只切 B；FSDP 沿权重 shard 且前后向 gather；TP 切 Dff/D 并对 activation 做 collective；二维设备网格的两轴通信可重叠才取 max，否则相加。最终找平衡点，而不是默认 GPU 越多越快。
+
+leaderboard 的长上下文、大词表、两 B200 完整 step 同时受 attention、lm-head CE、AdamW 和 activation memory 影响。优化候选包括 fused CE、fused optimizer、causal tile early exit、activation checkpoint 与更完整 Triton backward；每项都要和端到端正确 baseline 对比。
+
+## 测试与阅读入口
+
+- [A2 官方仓库](https://github.com/stanford-cs336/assignment2-systems)
+- [`test_attention.py`](https://github.com/stanford-cs336/assignment2-systems/blob/main/tests/test_attention.py)
+- [`test_ddp.py`](https://github.com/stanford-cs336/assignment2-systems/blob/main/tests/test_ddp.py)
+- [`test_sharded_optimizer.py`](https://github.com/stanford-cs336/assignment2-systems/blob/main/tests/test_sharded_optimizer.py)
+- [`test_fsdp.py`](https://github.com/stanford-cs336/assignment2-systems/blob/main/tests/test_fsdp.py)
+- [PyTorch distributed collectives](https://docs.pytorch.org/docs/stable/distributed.html)、[Triton tutorials](https://triton-lang.org/main/getting-started/tutorials/index.html)
+
+<Accordions>
+  <Accordion title="FlashAttention 出现 NaN">检查全 mask 行、最大值初始化、旧累积量重缩放、FP32 accumulator，以及写回前是否除以最终 l。</Accordion>
+  <Accordion title="DDP 与单进程差一个 world_size">通常是 all-reduce 后没有取平均，或 baseline loss reduction 与每 rank reduction 不一致。</Accordion>
+  <Accordion title="FSDP 第二步才坏">优先检查 optimizer 是否一直引用同一个 shard Parameter、full weight 是否正确释放、step 后 gather 的是否为新 shard。</Accordion>
+</Accordions>

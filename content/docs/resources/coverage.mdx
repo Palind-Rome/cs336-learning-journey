@@ -1,0 +1,42 @@
+---
+title: 材料覆盖审计
+description: 不是“写了几篇文章”，而是逐项确认 17 讲与 5 次作业没有知识空洞。
+---
+
+## 超集的定义
+
+本站把“内容超集”定义为：原材料每个主题/题型在站内都有可定位入口，同时额外提供先修、直觉、推导、张量形状、源码/测试证据、调试方法、实验设计和延伸阅读。它不意味着复制题面或发布可提交答案。
+
+## 17 讲覆盖
+
+| 讲次 | 原材料主题 | 精读 | 实现/专题 |
+|---:|---|---|---|
+| 1 | 总览、tokenization、BPE | [L1–4](/docs/lectures/01-04-basics) | [BPE](/docs/foundations/tokenization)、[A1](/docs/assignments/assignment-1) |
+| 2 | PyTorch、einsum、FLOPs、内存、优化 | [L1–4](/docs/lectures/01-04-basics) | [先修](/docs/foundations/prerequisites)、[训练](/docs/foundations/training) |
+| 3 | 现代 Transformer、norm/FFN/RoPE/GQA | [L1–4](/docs/lectures/01-04-basics) | [Transformer](/docs/foundations/transformer) |
+| 4 | 线性 attention、Mamba/DeltaNet、MoE | [L1–4](/docs/lectures/01-04-basics) | 架构取舍与路由推导 |
+| 5 | GPU、roofline、tiling、FlashAttention | [L5–8](/docs/lectures/05-08-systems) | [Kernel](/docs/systems/gpu-kernels) |
+| 6 | benchmark、profile、Triton | [L5–8](/docs/lectures/05-08-systems) | [A2](/docs/assignments/assignment-2) |
+| 7 | collectives、DP/TP/PP | [L5–8](/docs/lectures/05-08-systems) | [分布式](/docs/systems/distributed-inference) |
+| 8 | ZeRO/FSDP、sequence/expert/context parallel | [L5–8](/docs/lectures/05-08-systems) | [A2](/docs/assignments/assignment-2) |
+| 9 | 数据/参数/计算缩放、Chinchilla | [L9–11](/docs/lectures/09-11-scaling) | [Scaling](/docs/scaling/laws) |
+| 10 | 推理、KV cache、量化、speculative、batching | [L9–11](/docs/lectures/09-11-scaling) | [推理](/docs/systems/distributed-inference) |
+| 11 | μP、WSD、optimizer scaling、工业案例 | [L9–11](/docs/lectures/09-11-scaling) | [A3](/docs/assignments/assignment-3) |
+| 12 | PPL、知识/偏好/代理/安全评测、污染 | [L12–14](/docs/lectures/12-14-eval-data) | [评测](/docs/resources/evaluation-multimodal) |
+| 13 | 数据源、数据集史、法律与谱系 | [L12–14](/docs/lectures/12-14-eval-data) | [数据](/docs/data/pipeline) |
+| 14 | 抽取、filter、MinHash/LSH、mix、synthetic | [L12–14](/docs/lectures/12-14-eval-data) | [A4](/docs/assignments/assignment-4) |
+| 15 | SFT、偏好、RLHF、PPO、DPO | [L15–17](/docs/lectures/15-17-alignment-multimodal) | [后训练](/docs/alignment/post-training) |
+| 16 | RLVR、GRPO、R1/Kimi/Qwen、agentic RL | [L15–17](/docs/lectures/15-17-alignment-multimodal) | [A5](/docs/assignments/assignment-5) |
+| 17 | CLIP/SigLIP、LLaVA/Qwen-VL、VQ-VAE | [L15–17](/docs/lectures/15-17-alignment-multimodal) | [多模态](/docs/resources/evaluation-multimodal) |
+
+## 五次作业覆盖
+
+- **A1**：Unicode、BPE、tokenizer 实验；Linear/Embedding/RMSNorm/SwiGLU/RoPE/attention/block/LM；参数与 FLOP 核算；CE/AdamW/LR/clip/data/checkpoint/训练/解码；LR、batch、norm、position、FFN、数据集与 leaderboard 消融。
+- **A2**：benchmark/Nsight/mixed precision/memory；activation checkpoint；PyTorch/Triton FlashAttention forward/backward/benchmark；collective、naive/overlap DDP；optimizer state sharding；FSDP/mixed precision/full param；ring/DP/FSDP/TP/2D 计算通信推导与 leaderboard。
+- **A3**：合成 IsoFLOP 全流程、API/config/source、预算实验设计、拟合/外推、最终配置与报告。
+- **A4**：WARC/WAT/WET、HTML、lang ID、PII、harmful/quality/Gopher、exact line/MinHash 去重、完整流水线、tokenization 和固定训练比较。
+- **A5**：三种 prompting、token/mask/log-prob/entropy、group advantage、aggregation/train step、GRPO constant/Dr.GRPO/RFT/MaxRL、off-policy/GSPO、多 seed；可选 packed SFT、四类评测、HH 与 DPO。
+
+## 如何发现仍有空洞
+
+每次内容修改都按“材料项 → 精读 → 实现/测试 → 延伸”检查。若某项只有一行摘要而没有原理或可操作入口，就不算完成；若出现材料未覆盖的新说法，必须给原始论文/仓库来源或明确标为推论。

@@ -1,0 +1,41 @@
+---
+title: 作业工坊：先预测，再运行测试
+description: 五次作业的共同工作法、答案边界和调试纪律。
+---
+
+## 这不是答案仓库
+
+CS336 作业刻意只提供 tests 和 adapters，让你设计自己的实现。这里不会粘贴可提交的完整答案；会给出题目意图、接口契约、shape、伪代码、窄测试、失败症状和逐级提示。你仍需亲手完成实现并能解释每一行。
+
+## 通用循环
+
+1. 阅读 PDF 对应小题，写下输入、输出和不变量。
+2. 打开 `tests/adapters.py`，确认测试真正调用的签名。
+3. 预测一个最小样例的结果或 shape。
+4. 写最朴素的正确实现，只跑一个窄测试。
+5. 失败时先看第一个不同值、最大绝对误差、dtype/device 和广播轴。
+6. 正确后再做性能、并行或大规模实验。
+
+```bash
+# 在对应 assignment 目录内
+uv run pytest tests/test_model.py -k rmsnorm -v
+```
+
+<Cards>
+  <Card title="A1 · Basics" description="BPE、Transformer、AdamW 与训练循环" href="/docs/assignments/assignment-1" />
+  <Card title="A2 · Systems" description="Profile、FlashAttention、DDP、FSDP" href="/docs/assignments/assignment-2" />
+  <Card title="A3 · Scaling" description="用受限实验预算拟合缩放律" href="/docs/assignments/assignment-3" />
+  <Card title="A4 · Data" description="从网页到干净、去重的预训练语料" href="/docs/assignments/assignment-4" />
+  <Card title="A5 · Alignment" description="SFT、评测与 reasoning RL" href="/docs/assignments/assignment-5" />
+</Cards>
+
+## 调试记录模板
+
+```text
+现象：test_xxx 的输出在哪个位置首次不同？
+预期：shape / dtype / 数值范围 / 不变量
+假设：哪个轴、mask、边界或状态可能错误？
+最小实验：怎样用 2×3 的玩具输入证伪？
+结果：
+结论与下一步：
+```

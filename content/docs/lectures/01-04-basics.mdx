@@ -1,0 +1,80 @@
+---
+title: Lectures 1–4 · 基础与架构
+description: 从课程资源观、tokenization 与 FLOP 核算，到现代 Transformer、长上下文和 MoE。
+---
+
+## Lecture 1：课程不是组件清单，而是资源优化
+
+CS336 从“固定资源下最大化模型质量”统一五次作业。字节 tokenizer 完备却拉长序列；BPE 用词表内存换更短 T。GQA/滑窗减少 KV 与 attention 成本；数据过滤避免把计算浪费在垃圾上；缩放律用便宜小实验替代盲目大训练；RL 系统还要在吞吐与 on-policy 新鲜度间取舍。
+
+### 从字符串到 BPE
+
+Python `str` 表示 Unicode code point，`.encode('utf-8')` 才得到 bytes。单纯字符词表对不同书写系统不公平，单词词表永远遇到新词，256 字节词表则对任意文件完备。BPE 的目标不是语言学分词，而是学习一个可逆的压缩词典。
+
+训练步骤可写成带权多重集合：预分词结果 `w` 有频次 `f(w)`；pair `(u,v)` 的总计数是它在每个 w 中的非重叠出现次数乘 `f(w)`。每轮选定 pair、生成 `uv`、更新词表与 merge rank。编码阶段必须按训练优先级重放 merge，而不是“见到词表中最长串就贪心”。
+
+压缩率常用 `bytes/token`。高压缩让同样 context window 覆盖更多原文，也减少每样本 attention/MLP 计算；但词表过大会增大 embedding/lm-head 参数与 softmax 成本，并让稀有 token 学不充分。
+
+## Lecture 2：资源核算是一种调试语言
+
+### Tensor、dtype 与 shape
+
+`einsum('btd,df->btf', x, w)` 把 batch/time/feature 轴写明。FP32 4 bytes，BF16/FP16 2 bytes；BF16 指数范围接近 FP32、尾数更短，FP16 尾数更细但指数范围小。混合精度通常让大 matmul 用低精度、reduction/累积用 FP32，并保留 FP32 master weights/optimizer state。
+
+### FLOPs 怎么数
+
+`[B,M,K] @ [K,N]` 约 `2BMKN` FLOPs。线性层参数 P 在每个 token 前向约 `2P`；反向对输入和权重各一次类似 matmul，约再 `4P`，故 dense Transformer 训练粗估 `6×tokens×non-embedding parameters`。attention 的 `QKᵀ` 与 `PV` 另含约 `4BHT²Dh`，长 T 时不能忽略。
+
+这个近似用于量级规划，不包含 embedding lookup、norm、softmax、optimizer、重算、通信和硬件空泡。真实时间还受利用率影响。
+
+### 内存分解
+
+FP32 AdamW 直觉账本：参数 4P、梯度 4P、m/v 共 8P，尚未计激活；混合精度实现还可能有低精度参数副本。激活随 B、T、L、D 增长，标准 attention 概率随 T²。梯度累积减小每次 microbatch 激活但不减少模型状态；activation checkpoint 保存边界、反向重算内部，省显存但加 FLOPs。
+
+### Roofline
+
+算术强度 `I=FLOPs/bytes`；硬件平衡点 `I_hw=peak_FLOPs/memory_bandwidth`。若 `I<I_hw`，再加计算单元也难提速，应该减少数据搬运/融合；若更高，才主要受计算峰值限制。MFU 把端到端有效训练 FLOPs 除以设备理论峰值，数据等待、通信和小 kernel 都会拉低它。
+
+## Lecture 3：从 2017 Transformer 到现代 decoder
+
+原始 Transformer 是 encoder-decoder、sinusoidal absolute position、post-LayerNorm、ReLU FFN 和 dropout。现代预训练 decoder 常用 causal self-attention、pre-RMSNorm、RoPE、SwiGLU、无 bias，并按规模采用 GQA/滑窗/QK norm 等稳定或效率技巧。
+
+### Normalization 选择
+
+LayerNorm 减均值再除标准差；RMSNorm 只除均方根。pre-norm 为残差路径提供接近恒等的梯度高速路，深模型更稳，但最终 block 更新比例可能随深度变化。QK norm 对 Q/K 归一化以抑制 attention logit 爆大；z-loss 惩罚 log-partition 过大；logit soft-cap 用平滑函数限制极端值。这些是稳定性补丁，不应在 A1 基线未正确时一次全加。
+
+### FFN 与超参数
+
+普通 FFN 两矩阵，隐藏宽约 4D；SwiGLU 三矩阵，为近似匹配参数量用 `Dff≈8D/3` 并向 64/256 等硬件倍数取整。模型更深与更宽的训练/推理和并行特性不同；head dim 常保持 64/128，头数随 D 增长。词表增大改善压缩却加重 embedding/head。
+
+### Position 与 KV 成本
+
+RoPE 对 Q/K 的二维 pair 旋转，点积显式依赖相对位移。MQA 让所有 Q 头共享一组 K/V，GQA 介于 MHA 与 MQA，在质量和 KV cache 间调节。滑窗 attention 把大多数层限制在局部、少数层保持全局，长上下文成本下降但远距离信息路径变长。
+
+## Lecture 4：两条扩展路径
+
+### Attention alternatives
+
+去掉 softmax 或把相似度核化后，结合律允许 `Q(KᵀV)`，避免显式 T×T；causal 形式可递推 `S_t=S_{t−1}+k_tv_tᵀ`、`y_t=q_tᵀS_t`。代价是状态矩阵压缩所有历史，精确内容寻址能力可能弱于 full attention。
+
+Mamba-2、Gated DeltaNet 等给状态更新加入选择/门控；混合模型把线性层用于长程低成本记忆，间隔插入 full attention 做精确召回。评价它们不能只看渐近 O(T)：还要看并行训练、状态大小、kernel 成熟度、短序列常数和真实质量。
+
+### Mixture of Experts
+
+MoE 把 dense FFN 换成 E 个专家，对每 token 由 router 选 Top-K：
+
+```text
+h' = h + Σ(i in TopK) g_i(h) · Expert_i(h)
+```
+
+这样每 token 激活参数/K 个专家的计算近似不随总 E 线性增长，却增加总容量。细粒度专家提高组合数，共享专家承载通用知识。
+
+难点一是路由不可微/稀疏：常对被选专家权重做可微更新，router 用 softmax/噪声等近似。难点二是 collapse：少数专家拥塞、其他闲置；辅助负载均衡 loss、router bias 或 capacity factor 会改善吞吐，却可能干扰主任务。难点三是 expert parallel 的 all-to-all：token 先按专家发往不同设备，再把输出送回；负载不均直接变成 straggler。
+
+Upcycling 从训练好的 dense FFN 复制/扰动成专家，节约从零训练；DeepSeekMoE 的共享+细粒度专家、MLA/MTP 属于一整套架构与系统协同，不能把单点收益脱离 recipe 归因。
+
+## 四讲之后你应能做的事
+
+给任意 decoder config，画出每层 shape、估参数/FLOPs/激活/KV，解释 BPE、RoPE、GQA、SwiGLU 与 MoE 各自优化的资源；再到 [A1 工坊](/docs/assignments/assignment-1) 用测试把这些心智模型变成代码。
+
+推荐原始材料：[Linear Transformers](https://arxiv.org/abs/2006.16236)、[Mamba-2](https://arxiv.org/abs/2405.21060)、[Switch Transformers](https://arxiv.org/abs/2101.03961)、[DeepSeekMoE](https://arxiv.org/abs/2401.06066)。

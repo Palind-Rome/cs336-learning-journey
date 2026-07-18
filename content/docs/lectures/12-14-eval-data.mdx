@@ -1,0 +1,70 @@
+---
+title: Lectures 12–14 · 评测与数据
+description: 从“模型好不好”的测量问题，到数据来源、抽取、过滤、去重、混合与合成数据。
+---
+
+## Lecture 12：评测是测量学，不是排行榜
+
+### 概率评测
+
+语言模型对 token 序列的平均 NLL 可转 perplexity `exp(NLL)`。conditional PPL 只计目标续写、把给定上下文排除在分母外。PPL 对 tokenizer、空白、BOS/EOS 和数据域敏感；跨不同 tokenization 的模型比较最好回到总 byte/character log-likelihood 或下游任务。
+
+### 知识与推理
+
+MMLU 覆盖多学科选择题，但选项顺序、few-shot 与答案抽取都影响分数；MMLU-Pro 增选项并强调推理，GPQA/HLE 追求专家难度。GSM8K 等可验证数学题允许 exact/normalized answer，但模型可能思路错却碰巧答案对，或 parser 漏掉等价表达。
+
+### 偏好与 Arena
+
+pairwise 人类/LLM judge 的胜负可转 Elo：`P(A>B)=1/(1+10^((Elo_B−Elo_A)/400))`。Arena 更接近开放对话，却受用户分布、展示位置、模型身份和时间漂移影响。LLM judge 便宜可扩展，但有长度、风格、自我、位置偏差；应交换顺序、使用 rubric、报告 tie/置信区间并抽样人审。
+
+### 真实环境、能力与安全
+
+SWE-bench、TerminalBench、CyBench、MLEBench 把模型放进代码/终端/安全/ML 环境，得分依赖 agent scaffold、工具、timeout 和环境可复现性。ARC-AGI 测抽象归纳；真实性、安全/jailbreak 测不同风险面。不存在“一个总分”无损压缩所有能力。
+
+污染排查包括 exact/n-gram/minhash 检索、时间切分、canary 与受控新题；模型输出 benchmark 原文不是污染的充分必要证据。数据质量和评测质量相互依赖。
+
+## Lecture 13：训练数据从哪里来
+
+### 原始来源
+
+Common Crawl 提供大规模网页 WARC/WAT/WET；Wikipedia 结构清晰但文体单一；GitHub 需处理 license、vendor/生成文件与 secret；arXiv/PDF 需恢复阅读顺序、公式；books/StackExchange 质量较高但版权与领域偏差不同。在线服务数据更贴近用户，却涉及同意、隐私和反馈回路。
+
+### 数据集演化
+
+BERT 用 BooksCorpus+Wikipedia；WebText 从高质量外链反推网页；CCNet/C4 对 Common Crawl 做语言和规则过滤；GPT-3 mixture、The Pile 增强多域可控性；MassiveText/LLaMA/RefinedWeb/Dolma/DCLM 强调质量、去重、谱系与固定 recipe 比较；The Stack 聚焦许可可追踪代码；Common Pile 探索开放许可来源。
+
+趋势不是简单“数据越来越少”，而是每 token 的筛选、去重和混合更精细，mid-training/post-training 加入高质量、能力定向与合成数据。公开模型权重并不等于公开训练数据；应记录 source、snapshot、license、处理代码、filter 版本和 mixture weight，形成 lineage。
+
+### 法律与治理
+
+可访问不等于可训练或可再分发。版权、license、robots、隐私、地区法规和退出机制是不同问题。技术流水线至少保留 URL/域/时间/处理原因等审计元数据，同时限制敏感元数据访问。
+
+## Lecture 14：把原始来源变成训练分布
+
+### Transformation
+
+HTML boilerplate removal 要保留标题、段落和列表而去导航/广告；PDF 可能双栏、页眉页脚、扫描 OCR；代码需保留结构又移除 vendor/generated；VLM 可恢复复杂文档布局但成本高且可能幻觉。抽取错误会在后续所有 filter 前永久丢失信息，应抽样对照原文。
+
+### Filtering
+
+过滤器可以估 `p(target|x)`（质量/领域分类器）或用 target LM perplexity 给相似度，再硬阈值/概率采样。fastText language ID 便宜；KenLM/perplexity 可抓乱码；规则抓短页、符号、重复；毒性/NSFW/PII 模型处理风险。多级 cascade 先便宜后昂贵，但每级都要测不同语言/域的误伤。
+
+### Deduplication
+
+exact hash 捕捉全文一致；line dedup 去网页模板；n-gram Jaccard 捕捉近重复。MinHash 用 k 个最小 hash 构成签名，碰撞率估计 Jaccard；LSH 把 k=br 分 band：`P(candidate)=1−(1−s^r)^b`。候选对还需真实相似度验证，并用 connected components 合并传递簇。代表选择可按质量、长度、时间或许可，而非任意删一半。
+
+去重不仅省 token：可降低 memorization、train-test contamination 和重复样本对梯度的过度权重。但阈值太低会删掉合法模板、引用、不同版本代码和多语言翻译。
+
+### Mixing
+
+按原始比例会让大网页域吞没小而重要的书籍/代码；uniform 会过采小域、重复 epoch。manual mixture 靠经验；UniMax 给每域 epoch cap 后分剩余预算；RegMix 用许多小 proxy mixture 训练回归器预测大训练；simulated epoching 用重复惩罚表达边际收益递减。mixture 应针对目标评测而非“平均质量”。
+
+### Synthetic 与 post-training data
+
+模型可生成教科书式文本、指令、推理轨迹、难例或翻译；verifier/rejection sampling 提升正确率。风险是 teacher 偏差、模式收缩、错误自增强与训练/评测泄漏。保存 generator、prompt、采样参数、verifier、过滤率与 provenance，和人类数据分开做消融。
+
+## 三讲合并成可审计闭环
+
+先用目标评测定义需求，再选择数据源；处理流水线改变实际训练分布；训练后按分域 PPL/能力/安全评测诊断，再回到 mixture/filter。A4 固定模型 recipe，正是为了让这个反馈闭环主要归因于数据。
+
+进一步阅读：[C4/T5](https://jmlr.org/papers/v21/20-074.html)、[The Pile](https://arxiv.org/abs/2101.00027)、[RefinedWeb](https://arxiv.org/abs/2306.01116)、[Paloma](https://arxiv.org/abs/2312.10523)、[DataComp-LM](https://arxiv.org/abs/2406.11794)。

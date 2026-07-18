@@ -1,13 +1,40 @@
 ---
-title: Hello World
-description: Your first document
+title: 欢迎登船
+description: 从一行文本开始，走完一个语言模型的完整生命线。
 ---
 
-Welcome to the docs! You can start writing documents in `/content/docs`.
+CS336 的全名是 **Language Modeling from Scratch**。它不像“调用一个大模型 API”的课程，而像操作系统课：把一个复杂系统拆开，再亲手装回去。课程的主线只有一句话：
 
-## What is Next?
+> 在有限的数据、算力、显存和时间下，怎样造出尽可能好的语言模型？
+
+你会依次经历文本编码、Transformer、优化训练、GPU kernel、分布式、缩放律、数据工程、评测和后训练。五次作业恰好对应这条生产链，而不是五座互不相干的小岛。
+
+<Callout type="info" title="这是一份独立学习教程">
+  内容依据 Stanford CS336 Spring 2026 官网、讲义和学生版作业仓库编写，但不是 Stanford 官方翻译。外链均指向原始课程、论文或作者仓库。
+</Callout>
+
+## 你需要什么基础？
+
+不用先成为 LLM 专家。你最好见过 Python、矩阵乘法、导数和基本概率；不熟也可以从「零号站」补齐。真正重要的是愿意反复回答三件事：**张量形状是什么？资源花在哪里？测试证明了什么？**
 
 <Cards>
-  <Card title="Learn more about Next.js" href="https://nextjs.org/docs" />
-  <Card title="Learn more about Fumadocs" href="https://fumadocs.dev" />
+  <Card title="先看学习路线" description="按依赖关系安排 8–12 周学习节奏" href="/docs/roadmap" />
+  <Card title="零号站：先修知识" description="概率、线代、PyTorch 与语言模型目标" href="/docs/foundations/prerequisites" />
+  <Card title="直接进入作业工坊" description="用官方测试驱动五次作业" href="/docs/assignments" />
+  <Card title="17 讲课程地图" description="把每讲和章节、作业、材料对应起来" href="/docs/resources/lecture-map" />
 </Cards>
+
+## 怎么使用本站
+
+1. **先读直觉**：能用自己的话解释问题，再看公式。
+2. **手算形状**：任何神经网络 bug，先检查每个轴代表什么。
+3. **只实现一个接口**：运行最小测试，确认后再向外扩。
+4. **写实验日志**：记录假设、改动、指标和结论，不凭印象调参。
+
+作业章节故意不提供可整段复制提交的答案，而是给接口契约、伪代码、测试路径、分层提示和验收标准。这与[课程的 AI 与独立完成政策](https://cs336.stanford.edu/)一致，也更有利于真正学会。
+
+## 原始材料
+
+- [CS336 Spring 2026 课程官网](https://cs336.stanford.edu/)：课表、讲义、录像与作业入口。
+- [Stanford CS336 GitHub 组织](https://github.com/stanford-cs336)：讲义和五次作业的学生版仓库。
+- [Spring 2025 课程录像](https://www.youtube.com/playlist?list=PLoROMvodv4rOY23Y0BoGoBGgQ1zmU_MT_)：2026 讲义有更新，录像可作为概念补充，阅读时注意版本差异。

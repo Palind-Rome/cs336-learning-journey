@@ -1,0 +1,40 @@
+---
+title: SFT、DPO 与 GRPO
+description: 后训练的数据、目标函数、on-policy 推理训练与评测闭环。
+---
+
+## 预训练模型为什么不会自然成为助手？
+
+预训练目标是预测互联网文本的下一个 token，不是“遵循用户意图”。**SFT** 用 `(prompt, response)` 示范继续做交叉熵训练，通常只在 response token 上算 loss。它教格式和行为，但只能模仿示范分布。
+
+## 偏好学习：DPO
+
+偏好数据含 prompt、chosen、rejected。DPO 比较当前策略相对参考策略对两种回答的 log-prob 差，直接优化 chosen 胜出的对数逻辑损失。参考策略约束模型别离 SFT 太远，`β` 控制偏好强度。实现中必须对完整回答的 token log-prob 求和/按题面归一，并正确 mask prompt/padding。
+
+## 可验证奖励：GRPO / RLVR
+
+数学题可用答案检查器给 reward。对同一问题采样一组回答，组内标准化 reward 得 advantage，再用策略梯度提高高于组均值的回答概率。GRPO 不训练单独 value model，降低内存，但仍需处理：
+
+- rollout 来自哪个策略（on-policy 程度）；
+- 旧/新策略比率与 clipping；
+- 组内奖励全相同时标准差为零；
+- token mask、长度归一和 KL 正则；
+- 生成吞吐远慢于一次 teacher-forced forward。
+
+Assignment 5 的 `drgrpo_grader.py` 体现可验证数学奖励，`vllm_utils.py` 连接高吞吐生成；`prompts/` 展示 zero-shot、three-shot 和 R1 风格模板。不要只看训练 reward，还要在固定 held-out 集上报告准确率、格式成功率、输出长度和多样性。
+
+## 安全对齐补充
+
+可选题面使用 helpful/harmless 偏好数据和 DPO。安全不是让模型一律拒答：既要降低有害服从，也要测过度拒绝和一般能力回退。评测提示词、judge 模型和阈值本身都会影响结论。
+
+主作业题面聚焦 SFT、评测与推理 RL；`supplement_safety_rlhf.pdf` 是可选安全对齐部分，学习时注意二者范围。
+
+## 必读与源码
+
+- [InstructGPT](https://arxiv.org/abs/2203.02155)：SFT → reward model → PPO 的经典流水线。
+- [Direct Preference Optimization](https://arxiv.org/abs/2305.18290)：从 KL 约束最优策略推导 DPO。
+- [DeepSeekMath](https://arxiv.org/abs/2402.03300)：GRPO 与数学推理训练。
+- [DeepSeek-R1](https://arxiv.org/abs/2501.12948)：大规模推理 RL 的经验；阅读时区分论文系统与课程简化实现。
+- [Assignment 5 官方仓库](https://github.com/stanford-cs336/assignment5-alignment)。
+
+<CheckpointQuiz question="SFT 和 GRPO 的监督信号最本质的区别是什么？" options={['SFT 不使用 token', 'SFT 模仿给定回答；GRPO 从策略采样并用结果奖励比较回答', 'GRPO 不需要生成', '二者完全相同'] } answer={1} explanation="一个是示范上的最大似然，一个是采样轨迹上的奖励优化；数据分布和训练系统都不同。" />

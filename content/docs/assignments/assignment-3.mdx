@@ -1,0 +1,58 @@
+---
+title: Assignment 3 · Scaling
+description: 在真实 GPU 时间预算下设计实验、拟合 IsoFLOP 曲线并提交最终模型配置。
+---
+
+## 任务的真正难点
+
+你不是被要求“拟合一条线”，而是用有限实验预算决定下一次昂贵训练。合成数据教统计流程；在线 API 把约束换成 B200 wall-clock，架构、batch、dtype 与 kernel 效率都会影响同样 `6ND` 对应的时间。
+
+## 第一阶段：在合成数据上走通 IsoFLOP
+
+`data/isoflops_curves.json` 含 72 个 run、9 个 compute budget、每档 8 个模型。对每个 C：画 N–loss 曲线，确认最低点两侧都有观测；取最低 loss 对应 `N*`，再由 `D*=C/(6N*)` 得 token 数。对 `(log C, log N*)` 和 `(log C, log D*)` 线性回归：
+
+```text
+N*(C)=A·C^a     D*(C)=B·C^b
+log N*=log A+a log C
+```
+
+<Callout type="info" title="复算，不是唯一标准答案">
+  按“每档直接取最小点 + log-OLS”，当前数据可复算得 a≈0.4687、b≈0.5313；外推值会随拟合方法、边界点和异常处理略变。报告必须写清方法与不确定性。
+</Callout>
+
+## 第二阶段：读懂训练 API 和 config
+
+先读 `cs336_scaling/client.py`：budget、submit、experiments、单 run 与 final submission。再逐行读 `training/training_config.py`，把 validator 当成搜索空间说明书：sequence 512、hidden size 与 heads/head_dim 的整除关系、RoPE 偶数 head_dim、FFN 不小于 hidden、token/batch/eval 的整除条件等。
+
+默认模型在 `training/run.py`，真正结构在 `training/model/basic_model.py`：JAX/Equinox、RMSNorm、RoPE、QK norm、SwiGLU 和 FSDP sharding。`training/loop.py` 说明训练与验证如何按 next-token CE 计量。
+
+## 第三阶段：用 12 B200-hours 买信息
+
+1. 极短 pilot：验证 API、吞吐、loss 会降、学习率不爆。
+2. 多预算宽扫 N：先包住谷底，不急着密集。
+3. 对最低点附近加密；边界最优必须扩区间。
+4. 用不同 `model_seed` 复现关键点；保留预算处理失败/timeout。
+5. 拟合后做 held-out budget 检验，再映射到最终 layers/width/heads/FFN/batch/lr/tokens。
+
+每个 run 提交前先回答：“它能区分哪两个决策？”排队和运行会按预留最大时长占预算，别用夸大的 runtime 把预算锁死。
+
+<AssignmentStepper items={[
+  '合成曲线按 budget 分组并画出最低点',
+  '在 log 空间拟合，报告残差与边界点',
+  '最小 API pilot 成功且记录实际吞吐',
+  '搜索范围覆盖每条曲线谷底两侧',
+  '留出关键点复现与异常预算',
+  '最终参数量用模型代码实际统计验证'
+]} />
+
+## 常见失败
+
+- 直接在线性空间拟合，让大数值点支配；
+- 把 failed/timeout 的中途 loss 当 final；
+- 只用 `6ND` 估真实 runtime；
+- token/batch/eval 不满足 config 整除；
+- 同 config 重复提交触发 409，复现时没换 seed；
+- 最优点在搜索边缘仍强行拟合；
+- 用尽探索预算，没有独立检验。
+
+证据入口：[A3 仓库](https://github.com/stanford-cs336/assignment3-scaling)、[`training_config.py`](https://github.com/stanford-cs336/assignment3-scaling/blob/main/cs336_scaling/training/training_config.py)、[`client.py`](https://github.com/stanford-cs336/assignment3-scaling/blob/main/cs336_scaling/client.py)。

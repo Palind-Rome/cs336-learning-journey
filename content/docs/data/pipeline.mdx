@@ -1,0 +1,33 @@
+---
+title: 从 Common Crawl 到训练语料
+description: 抽取、语言识别、质量过滤、PII/毒性处理、MinHash 去重与数据混合。
+---
+
+## 数据流水线不是一把筛子
+
+原始网页 → HTML 文本抽取 → 文档规范化 → 语言识别 → 质量/安全过滤 → 精确与模糊去重 → 数据混合 → tokenizer。每一步都应输出统计量和样本，能回答“删了多少、为何删、误伤什么”。顺序会影响成本与结果：便宜过滤通常在昂贵模型前，去重前的规范化必须固定。
+
+## 质量启发式
+
+assignment 的测试涵盖 Gopher 风格规则：词数、平均词长、符号/省略号比例、重复 n-gram、行尾标点、字母比例等。启发式便宜且可解释，但会偏向特定语言和文体；阈值不是普世真理。模型分类器更灵活，却会继承训练集偏见。
+
+## 去重：从哈希到 MinHash
+
+- **精确文档去重**：规范化文本后 hash；只抓完全一致。
+- **行去重**：统计跨文档重复行，再删除达到频率阈值的模板行。
+- **模糊文档去重**：把文档变成 n-gram shingles 集合，用 Jaccard 相似度衡量。
+
+直接比较所有文档是 O(n²)。MinHash 用多个哈希函数记录每个集合的最小 hash；两个签名位置相等的比例估计 Jaccard。再用 LSH banding 只产生候选对，最后以并查集/连通分量选择代表文档。band 数和每 band 行数共同控制假阳性/假阴性曲线。
+
+## PII 与毒性
+
+邮箱、IP、电话号码可检测后 mask 或删除文档。高召回会误伤代码、引用和科学文本；低召回会泄露隐私。毒性分类同样是带价值判断的测量工具，应记录模型、阈值、语言覆盖和失败样例，而非把分数当客观真理。
+
+## Assignment 4 的证据入口
+
+- [`test_extract.py`](https://github.com/stanford-cs336/assignment4-data/blob/main/tests/test_extract.py)：HTML 抽取；
+- [`test_quality.py`](https://github.com/stanford-cs336/assignment4-data/blob/main/tests/test_quality.py)：质量规则；
+- [`test_deduplication.py`](https://github.com/stanford-cs336/assignment4-data/blob/main/tests/test_deduplication.py)：精确、行级与 MinHash；
+- [`test_langid.py`](https://github.com/stanford-cs336/assignment4-data/blob/main/tests/test_langid.py)、[`test_pii.py`](https://github.com/stanford-cs336/assignment4-data/blob/main/tests/test_pii.py)、[`test_toxicity.py`](https://github.com/stanford-cs336/assignment4-data/blob/main/tests/test_toxicity.py)。
+
+必读：[Deduplicating Training Data Makes Language Models Better](https://arxiv.org/abs/2107.06499)、[DataComp-LM](https://arxiv.org/abs/2406.11794)、[Dolma](https://arxiv.org/abs/2402.00159) 及其[开源工具仓库](https://github.com/allenai/dolma)。

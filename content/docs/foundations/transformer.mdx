@@ -1,0 +1,66 @@
+---
+title: Transformer：逐个部件装回去
+description: Embedding、RMSNorm、RoPE、注意力和 SwiGLU 的形状与设计动机。
+---
+
+## 从输入到 logits
+
+decoder-only Transformer 的数据流是：token id → embedding → 重复 L 层 Transformer block → 最终 RMSNorm → 词表线性投影。输出 logits 的形状 `[B,T,V]`，每个位置只与“下一个 token”标签比较。
+
+### 1. Embedding 与 Linear
+
+Embedding 是查表 `W[token_ids]`，参数 `[V,D]`；Linear 是 `x @ Wᵀ`。作业要求自己定义权重并初始化，重点不是重写 PyTorch，而是确认参数方向、初始化尺度、dtype/device 能被正确传递。
+
+### 2. Pre-norm 残差块
+
+现代 decoder 常用：
+
+```text
+x = x + Attention(RMSNorm(x))
+x = x + FFN(RMSNorm(x))
+```
+
+残差为梯度提供短路径；pre-norm 比 post-norm 更易训练深网络。RMSNorm 只按最后一维用均方根缩放，不减均值：`x / sqrt(mean(x²)+eps) * weight`。为避免低精度平方溢出，归一化内部常转 `float32`，最后转回输入 dtype。
+
+### 3. Causal self-attention
+
+对输入分别线性投影得 `Q,K,V`，拆成 H 个头。每个头计算：
+
+```text
+scores = Q Kᵀ / sqrt(d_head)
+scores[未来位置] = -∞
+weights = softmax(scores)
+output = weights V
+```
+
+除以 `sqrt(d_head)` 是为了控制点积方差，避免 softmax 在初始化时过度饱和。causal mask 必须在 softmax 前施加，并能广播到 batch 和 head 轴。
+
+<TensorShapeLab />
+
+### 4. RoPE：把相对距离写进点积
+
+RoPE（Rotary Position Embedding）把 Q/K 的相邻维度视作二维向量，按位置和频率旋转。旋转矩阵满足 `R(m)ᵀR(n)=R(n−m)`，因此注意力点积自然含相对位置差。它不作用于 V，也不改变张量 shape。
+
+### 5. SwiGLU 前馈层
+
+`FFN(x) = W₂(SiLU(W₁x) ⊙ W₃x)`。一条支路做平滑门控，一条提供内容，逐元素相乘后投回 D。参数预算下常令隐藏维约 `8/3·D` 并向硬件友好倍数取整，而不是传统 ReLU FFN 的 `4D`。
+
+## 数值稳定的 softmax
+
+```python
+shifted = x - x.max(dim=-1, keepdim=True).values
+probs = shifted.exp() / shifted.exp().sum(dim=-1, keepdim=True)
+```
+
+减去常数不会改变 softmax，却把最大指数固定为 1。交叉熵也应通过 log-sum-exp 技巧实现，避免先 softmax 再 log。
+
+## 源码阅读顺序
+
+先读 Assignment 1 的 [`tests/adapters.py`](https://github.com/stanford-cs336/assignment1-basics/blob/main/tests/adapters.py)，把接口画成依赖图；再按 `Linear → Embedding → RMSNorm → RoPE → attention → FFN → block → LM` 顺序让测试变绿。快照测试给定固定权重和输入，输出不一致通常是 shape、转置、mask 或 epsilon 位置错误。
+
+## 架构延伸
+
+- [Attention Is All You Need](https://arxiv.org/abs/1706.03762)：原始 encoder-decoder Transformer；注意它与现代 decoder-only 配方并不完全相同。
+- [RoFormer](https://arxiv.org/abs/2104.09864)：RoPE 原论文。
+- [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202)：SwiGLU 的实验依据。
+- [Llama 3 模型代码](https://github.com/meta-llama/llama3/blob/main/llama/model.py)：在完成自己的实现后，对照工业级简洁实现。

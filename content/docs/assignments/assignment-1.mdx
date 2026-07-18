@@ -1,0 +1,124 @@
+---
+title: Assignment 1 · Basics
+description: 用官方测试亲手完成 tokenizer、Transformer、优化器与训练闭环。
+---
+
+## 最终作品
+
+你将把文本训练成 BPE token，自己实现现代 decoder-only Transformer 和 AdamW，在 TinyStories / OpenWebText 上训练并生成。题面很长，但依赖关系清晰：
+
+```text
+BPE → Tokenizer → token file
+Linear/Embedding/RMSNorm/RoPE/SwiGLU/Attention
+             ↓
+Transformer LM → cross entropy → AdamW → checkpoint → generation
+```
+
+## 第一阶段：BPE 与 Tokenizer
+
+### Step 1：玩具 BPE
+
+接口返回 `dict[int, bytes]` 和按优先级排列的 merge pairs。先只用 4 个短词：预分词频次 → bytes tuple → 相邻 pair 计数（乘词频）→ 选择最高频 → 合并所有非重叠位置。并列时按题面规定的 bytes pair 字典序处理。
+
+特殊 token 是硬边界：先用转义后的正则切开，不参与普通 pair 计数，也不能跨过去 merge。当前材料中 adapter 尾部有一处旧文案与题面/测试不同，行为以 2026 PDF 和 `test_train_bpe_special_tokens` 为准。
+
+```bash
+uv run pytest tests/test_train_bpe.py -k "not speed" -v
+uv run pytest tests/test_train_bpe.py -k speed -v
+```
+
+正确后才优化。若每轮重扫整个语料，速度测试很可能失败；思考“本轮合并只会改变哪些 pair”，维护 pair 到受影响 pre-token 的索引。
+
+### Step 2：编码器
+
+建立 `bytes→id` 和 `pair→merge_rank`。每个 pre-token 从单字节序列开始，总是执行当前 rank 最小的可用 merge。特殊 token 重叠时 longest-first；`decode` 先拼 bytes，再用 `errors='replace'` 解 UTF-8。`encode_iterable` 必须真流式，不能先 join。
+
+<AssignmentStepper items={[
+  '空串、ASCII、汉字与 emoji 都能 round-trip',
+  '特殊 token 连续、重叠、换行边界通过',
+  '与 GPT-2 fixture 对齐',
+  '流式编码不把整个输入读入内存',
+  '记录 TinyStories/OWT 的压缩率与吞吐，不虚构数据'
+]} />
+
+## 第二阶段：逐层搭 Transformer
+
+按以下顺序，每次只让一组快照测试变绿：
+
+| 部件 | 输入 → 输出 | 最常见错误 |
+|---|---|---|
+| Linear | `(..., Din)→(...,Dout)` | 权重应为 `(Dout,Din)`，计算 `xWᵀ` |
+| Embedding | ids `(...)→(...,D)` | 把查表误写成 dense one-hot matmul |
+| RMSNorm | `(...,D)→(...,D)` | 沿错轴、减均值、平方前没 upcast |
+| SwiGLU | `(...,D)→(...,D)` | `W2` 方向、门控误写成加法 |
+| RoPE | `(...,S,Dh)→同形` | 作用到 V、pair 顺序或广播错误 |
+| SDPA | `Q,K,V→(...,Q,Dv)` | mask 语义反、softmax 轴错 |
+| MHA | `(...,S,D)→同形` | 拆头/合头转置和 causal mask |
+
+多头路径应画在纸上：`(...,S,D) → (...,H,S,Dh) → (...,S,D)`；Q/K/V 各做一次整体矩阵乘法，不要逐头循环。block 使用 pre-norm：`x + Attn(Norm(x))`，再 `z + FFN(Norm(z))`。
+
+<TensorShapeLab />
+
+测试顺序：`linear/embedding → rmsnorm/softmax → swiglu → attention 3D/4D → rope → MHA → block → LM`。`transformer_lm_truncated_input` 提醒你输入 S 可以小于 context length，不能硬编码。
+
+## 第三阶段：训练基础设施
+
+- Cross entropy：用 `logsumexp(logits) - target_logit`，不要 `log(softmax)`。
+- AdamW：step 从 1 参与 bias correction；moment 与解耦 weight decay 分开；跳过 `grad is None`。
+- LR schedule：测试 warmup 起止、cosine 末端和之后四个边界。
+- Clip：把所有梯度视为一个大向量算全局范数，共同缩放。
+- Data loader：一维 token 数组随机切 `[T+1]`，相邻切成 x/y。
+- Checkpoint：model、optimizer、iteration 都保存；同时支持路径和二进制 file-like。
+
+### 最小训练验收
+
+先在单个 batch 上过拟合。若几十到几百步仍不能显著降 loss，不要启动长训练。确认 label 是输入右移一位、最后维是 vocab、评测时无梯度、保存加载后下一步完全一致。
+
+## 第四阶段：实验而不是“炼丹”
+
+每次消融只变一个因素：学习率、batch、去 RMSNorm、pre/post norm、去 RoPE、SwiGLU vs 参数量近似公平的 SiLU FFN。横轴同时报告 step 和 wall-clock；不同数据集的 loss 不可脱离 tokenizer/分布直接横比。
+
+生成时只取最后位置 logits，temperature 后做 top-p 截断、重归一化采样，遇 EOS 或上限停止。注意 A2 staff 模型的生成辅助可能用 top-k，不要把它误当 A1 题面的 top-p。
+
+## 题面逐项工作台
+
+### Unicode 与 tokenizer 实验
+
+- `unicode1/2`：在 REPL 比较 code point、UTF-8/16/32 bytes，构造“单个 byte 无法独立 decode”和“非法 UTF-8”反例。
+- `train_bpe_tinystories / expts_owt`：分别训练题面词表，记录 wall time、峰值内存、最长 token 和可解释样本；不要预填别人机器的数。
+- `tokenizer_experiments`：测同域/跨域 bytes-per-token 与 encode/decode 吞吐，再明确线性外推到大语料所假设的硬件、IO 与并行度。vocab 小于 65,536 时解释为何 `uint16` 足够。
+
+### 参数、显存与 FLOP 核算
+
+列出 embedding/lm head；每层 Q/K/V/O 四个 D×D；SwiGLU 的 D×Dff、D×Dff、Dff×D；norm gain。明确 weight tying 是否启用、bias 是否存在、embedding 是否算入 non-embedding N。
+
+前向 FLOPs 用每次 matmul `2×输出元素×reduction_dim`；attention 单独包含 QKᵀ 与 PV 的 T² 项。训练粗估是前向参数 matmul约 2、反向约 4 倍 parameter-token product，但题面小问需要逐项列式。显存表分别写 parameter、gradient、Adam m/v、activation；不要把 activation checkpoint 与保存训练 checkpoint 混淆。
+
+### 训练与生成实验
+
+| 小题 | 控制变量 | 至少记录 |
+|---|---|---|
+| learning-rate tuning | 只改 peak LR | train/val loss、发散边界、wall time |
+| batch size | batch 与必要的 LR 重调 | tokens/s、step/time loss、显存 |
+| layer norm ablation | 删除 RMSNorm | 梯度范数、稳定性、最终 loss |
+| pre-norm ablation | norm 移到残差之后 | 深度下稳定性，确认不同时改别处 |
+| no positional embedding | 去 RoPE | 长/短依赖样例与 val loss |
+| SwiGLU ablation | 与约 4D 非门控 SiLU FFN 比 | 参数量近似匹配后再比 |
+| main experiment | TinyStories vs OWT | 同预算/架构；不跨域直接比 loss |
+| generation | temperature/top-p | 至少 256 token 或 EOS，定性失败分类 |
+| leaderboard | 45 分钟给定硬件/数据 | 小规模证据、最终 config、吞吐与 loss |
+
+`experiment_log` 每次写 config、seed、commit、step、token、wall-clock、train/val metric。生成失败可分为局部不流畅、重复循环、事实/情节不一致、格式不闭合；分别联系数据、容量、训练量与采样，不用一句“模型太小”包办。
+
+## 证据与延伸
+
+- [A1 官方仓库](https://github.com/stanford-cs336/assignment1-basics)
+- [`tests/adapters.py`](https://github.com/stanford-cs336/assignment1-basics/blob/main/tests/adapters.py)：接口契约
+- [`tests/test_model.py`](https://github.com/stanford-cs336/assignment1-basics/blob/main/tests/test_model.py)：模型快照
+- [`tests/test_optimizer.py`](https://github.com/stanford-cs336/assignment1-basics/blob/main/tests/test_optimizer.py)：AdamW/LR/clip
+
+<Accordions>
+  <Accordion title="提示 1：attention 输出不对，先看什么？">用 B=1,H=1,T=3 的整数小例子，打印 scores、mask 后 scores、每行概率和。确认 key 轴 softmax，未来位置概率为 0。</Accordion>
+  <Accordion title="提示 2：RoPE 快照不对，先看什么？">先测 position 0 恒等、每对二维向量范数保持，再检查缓存索引和偶/奇维配对方式。</Accordion>
+  <Accordion title="提示 3：AdamW 只差一点点？">逐步对照第一步的 m、v、bias correction、epsilon 位置与 decay；多数是 step off-by-one 或把 decay 混进 gradient。</Accordion>
+</Accordions>

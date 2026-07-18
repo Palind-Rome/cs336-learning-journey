@@ -1,0 +1,36 @@
+---
+title: 并行训练与高效推理
+description: DDP、FSDP、通信代价、KV cache 与吞吐/延迟权衡。
+---
+
+## 复制什么，切分什么？
+
+**DDP** 在每张 GPU 放完整模型，各自处理不同 mini-batch；反向时 all-reduce 梯度，使每张卡得到相同平均梯度。计算扩展简单，但参数、梯度、优化器状态仍在每卡完整复制。
+
+**FSDP** 将参数、梯度和优化器状态切分。计算某层前 all-gather 该层参数，反向后 reduce-scatter 梯度，再释放完整参数。省显存的代价是更多通信与更复杂的生命周期管理。
+
+| 方法 | 每卡参数 | 主要通信 | 适用场景 |
+|---|---:|---|---|
+| DDP | 完整 | 每步梯度 all-reduce | 模型放得下、追求简单吞吐 |
+| FSDP/ZeRO-3 | 分片 | 参数 all-gather + 梯度 reduce-scatter | 模型状态放不下 |
+| Tensor Parallel | 层内切矩阵 | 每层 collectives | 单层/模型无法单卡容纳 |
+| Pipeline Parallel | 按层切 | stage 间激活 | 超深模型，需管理 bubble |
+
+## DDP 的正确性细节
+
+参数必须在构造时广播一致；每个参数梯度就绪后触发异步 all-reduce，并除以 world size。为了重叠通信和反向计算，真实系统把梯度装入 bucket；极简作业实现则适合先理解 hook、异步 handle 和 `finish_gradient_synchronization()` 的同步边界。
+
+FSDP 要特别关注参数在 forward/backward 的 materialize/free 时机、梯度累积，以及扁平化参数与原始参数的映射。官方 [`test_ddp.py`](https://github.com/stanford-cs336/assignment2-systems/blob/main/tests/test_ddp.py)、[`test_fsdp.py`](https://github.com/stanford-cs336/assignment2-systems/blob/main/tests/test_fsdp.py) 和 [`test_sharded_optimizer.py`](https://github.com/stanford-cs336/assignment2-systems/blob/main/tests/test_sharded_optimizer.py) 用单进程基线验证数值等价。
+
+## 推理的两个阶段
+
+- **Prefill**：一次处理整段 prompt，矩阵较大、并行度高，常偏 compute-bound。
+- **Decode**：每步只新增一个 token，却要读取所有层参数与历史 K/V，常偏 memory-bandwidth-bound。
+
+KV cache 避免每一步重算历史 K/V，代价约随 `layers × batch × sequence × kv_heads × head_dim × 2 × bytes` 增长。GQA/MQA 通过让多个 query 头共享较少 K/V 头，降低 cache 和读取带宽。连续批处理把不同请求动态塞入 GPU；paged attention 用非连续页管理 KV cache，减少碎片。
+
+## 延迟与吞吐不能混成一个数
+
+服务指标至少区分 TTFT（首 token 时间）、TPOT（后续 token 间隔）、端到端延迟与 tokens/s。增大 batch 往往提高吞吐却伤害单请求延迟；量化减少权重带宽，但校准误差可能损失质量。
+
+必读：[Efficient Large-Scale Language Model Training on GPU Clusters](https://arxiv.org/abs/2104.04473)、[ZeRO](https://arxiv.org/abs/1910.02054)、[vLLM / PagedAttention](https://arxiv.org/abs/2309.06180)，以及 [CS336 lecture 10](https://github.com/stanford-cs336/lectures/blob/main/lecture_10.py)。

@@ -1,0 +1,38 @@
+---
+title: Scaling Laws：预算如何分给模型与数据
+description: 幂律、compute-optimal frontier、拟合陷阱与 Assignment 3 实验方法。
+---
+
+## 幂律是经验模型，不是自然定律
+
+测试损失常可近似写成 `L(N,D)=E + A/N^α + B/D^β`：`E` 是不可约损失，N 是非 embedding 参数量，D 是训练 token 数。随着 N/D 增加，收益递减；在 log-log 图上幂律项接近直线。
+
+训练计算粗略 `C≈6ND`。固定 C 时，增大 N 就必须减少 D，因此存在 compute-optimal 配比。Kaplan 等早期结果和 Chinchilla 的结论不同，重要原因包括实验范围、模型/数据定义与拟合方法；不要背一个固定的“token/参数比”当真理。
+
+<ScalingLab />
+
+## IsoFLOP 方法
+
+对若干计算预算 C，分别训练不同 N、相应令 `D=C/(6N)`，在每条预算曲线上找到最低 loss 的 `(N*,D*)`；再在 log 空间拟合 `N*(C)`、`D*(C)` 与最优 loss。Assignment 3 让你通过训练 API 设计这些实验，真正稀缺的是**预算和实验信息量**。
+
+## 拟合时的五个坑
+
+1. 把尚未收敛或训练不稳定的 run 当成正常点；
+2. 最优点落在搜索边界，说明范围没包住谷底；
+3. 不同 tokenizer/数据/上下文长度的 token 不可直接等价；
+4. 只报告拟合内误差，不做 held-out budget 外推；
+5. 用参数最多的模型当最好，而忽略固定 compute 约束。
+
+## Assignment 3 的代码地图
+
+`cs336_scaling/training/` 是 JAX/Equinox 训练核心，`training_config.py` 定义实验变量；`model/config.py` 把层数、维度和头数变成模型；`client.py`/`schemas/experiment.py` 是提交与查询契约；`data/isoflops_curves.json` 保存曲线数据。先理解 config → 参数量 → token budget → run result 的数据流，再碰拟合。
+
+建议每次提交前写下：**这个 run 能区分哪两个假设？** 若答案只是“也许更好”，信息价值通常太低。
+
+## 必读
+
+- [Scaling Laws for Neural Language Models](https://arxiv.org/abs/2001.08361)：Kaplan 等，理解 separable power law 与早期 compute-optimal 结论。
+- [Training Compute-Optimal Large Language Models](https://arxiv.org/abs/2203.15556)：Chinchilla；重点读 isoFLOP 分析与重新拟合。
+- [Open LLM Leaderboard / evaluation caveats](https://huggingface.co/docs/leaderboards/open_llm_leaderboard/about)：观察“单一指标”如何受任务和污染影响。
+
+<CheckpointQuiz question="某条 IsoFLOP 曲线的最低 loss 出现在你测试的最大模型上，最合理的下一步是什么？" options={['宣布最大模型就是全局最优', '向更大 N 扩展搜索或重新安排该预算的点', '删除这条曲线', '把 loss 取倒数'] } answer={1} explanation="边界最优通常表示搜索区间没有覆盖谷底，不能据此可靠拟合最优 frontier。" />

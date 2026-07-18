@@ -1,0 +1,39 @@
+---
+title: GPU、Kernel 与 FlashAttention
+description: 从 roofline 到 Triton，理解 Assignment 2 为何重写 attention。
+---
+
+## GPU 快，不等于你的程序快
+
+GPU 有大量并行计算单元，但数据要从 HBM 搬到片上 SRAM/寄存器才能计算。矩阵乘法对搬来的数据反复复用，算术强度高；逐元素操作往往每读一个数只算一两次，受内存带宽限制。多个 PyTorch 操作还会启动多个 kernel，把中间结果写回 HBM。
+
+**Kernel fusion** 把连续操作合并：中间值留在片上，不往返 HBM。Triton 让你以 program/block 为单位写 GPU kernel：每个 program 负责输出的一块，用 `program_id` 定位，`tl.load/store` 配合 mask 处理边界。
+
+## 先测，再优化
+
+1. warmup，排除首次编译和缓存；
+2. GPU 操作异步，计时前后同步或用 CUDA events；
+3. 改变序列长度、dtype、块大小，不只测一个点；
+4. 同时报 latency、吞吐和峰值显存；
+5. profiler 用来解释，不用它替代端到端指标。
+
+## 普通 attention 为什么占显存？
+
+标准实现物化 `[B,H,T,T]` 的 score/probability 矩阵，空间随 `T²` 增长。FlashAttention 并没有近似 attention；它把 Q/K/V 分块装入 SRAM，在线维护每行 softmax 的最大值 `m`、归一化因子 `l` 和累积输出 `O`，因此不必把完整分数矩阵写回 HBM。
+
+### 在线 softmax 的关键
+
+新块到来时最大值可能变大。旧累积量必须乘 `exp(m_old−m_new)` 后再和新块合并。这是 forward 正确性的核心，也是 backward 重算策略的基础。因果 mask 要基于**全局 token 索引**，不是块内索引。
+
+<Callout type="warn" title="性能题先保证正确">
+  Assignment 2 的快照与梯度测试会覆盖不同 shape、causal 模式和边界块。通过正确性后再调 `BLOCK_Q/BLOCK_K`、warps 和重算；一次只改变一个因素。
+</Callout>
+
+## 源码与论文
+
+- [`tests/test_attention.py`](https://github.com/stanford-cs336/assignment2-systems/blob/main/tests/test_attention.py)：官方 forward/backward 契约与 benchmark 形状。
+- [FlashAttention](https://arxiv.org/abs/2205.14135)：IO-aware 的问题定义；重点读 tiling 和复杂度分析。
+- [FlashAttention-2](https://arxiv.org/abs/2307.08691)：减少非矩阵运算并改善并行划分。
+- [Triton fused softmax 教程](https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html)：先用小 kernel 熟悉 program、mask 与 num_warps。
+
+<CheckpointQuiz question="FlashAttention 的主要收益来自哪里？" options={['减少精确 attention 的数学 FLOPs 到线性', '减少 HBM 与片上存储之间的读写并避免物化 T×T 矩阵', '删除 softmax', '只使用更低精度'] } answer={1} explanation="它仍计算精确 attention；核心是 IO-aware 分块、在线 softmax 与重算。" />

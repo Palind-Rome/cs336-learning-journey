@@ -1,0 +1,57 @@
+---
+title: Assignment 4 · Data
+description: 构建可审计的 Common Crawl 过滤与去重流水线，并用固定训练配方比较数据。
+---
+
+## 先培养“数据感觉”
+
+先人工看 25 个网页：语言、页面类型、正文比例、模板噪声、重复、隐私和训练价值。WARC 保存原始响应，WAT 是元数据，WET 是抽取文本；题面先让你理解格式，再处理英语 WET 列表。
+
+## 第一阶段：抽取、语言与 PII
+
+HTML 抽取用 FastWARC 遍历 response record、处理编码，再由 Resiliparse 取正文。`test_extract.py` 与固定 Moby Dick 结果逐字比较，说明空白和段落边界也是契约。
+
+fastText language ID 返回短标签与正 score；PII mask 必须使用题面精确占位符。regex 只是启发式：IPv4 四段需限制 0–255；电话会误伤日期、订单号；已有 mask 不应重复计数。
+
+## 第二阶段：质量与 harmful content
+
+Gopher 必做规则包括词数 50–100,000、平均词长 3–10、以 `...` 结尾行比例不超过 30%、至少 80% 词含字母。测试决定“word”的具体解析方式，别凭直觉改定义。
+
+NSFW/toxic 与 wiki-vs-CC 质量分类器都要在真实样本上审计阈值。分类器训练域与网页域不同会 domain shift；输出 kept/dropped、分数分布、误杀/漏网样本，而不是只给一个保留率。
+
+## 第三阶段：两种去重
+
+精确行去重必须跨全语料两遍：第一遍稳定 hash 计频，第二遍只保留全局唯一行，同时仍输出所有同名文件。不要用跨运行随机化的 Python `hash()`。
+
+模糊去重：lowercase、去标点、统一空白、Unicode NFD 后去 combining marks；构造 n-gram 集合、MinHash signature、LSH band 候选，再验证真实 Jaccard。候选关系有传递性，使用并查集得到簇并选代表。
+
+```text
+P(成为候选 | 相似度 s) = 1 − (1 − s^r)^b
+```
+
+固定 signature 长度时，更多 band 通常提高 recall 也增加假候选。LSH 只负责找候选，不应“同 band 就直接删除”。
+
+## 第四阶段：组合与训练
+
+每篇文档加 GPT-2 EOS，token ids 存 `np.uint16`。固定模型约 430M 参数、context 512、8 GPU、每卡 batch 128、16,384 steps，因此训练约 `8×128×512×16384 = 8.59B` token。只改变数据，才能把验证差异归因于流水线。
+
+<AssignmentStepper items={[
+  'HTML/语言/PII 三组窄测试通过',
+  '质量和 harmful 阈值有人工审计表',
+  '精确行去重是全局两遍且保留文件结构',
+  'MinHash 候选再由真实相似度验证',
+  '每个 filter 记录原因与样本',
+  'tokenize 时文档间有 EOS 且 dtype 正确',
+  '训练未混入固定验证数据'
+]} />
+
+## 测试契约速查
+
+`tests/adapters.py` 是 11 个入口。语言需映射 `en/zh`；mask 字符串为 `|||EMAIL_ADDRESS|||`、`|||PHONE_NUMBER|||`、`|||IP_ADDRESS|||`；harmful 标签使用 `nsfw/non-nsfw` 与 `toxic/non-toxic`；质量标签为 `wiki/cc`。去重测试检查输出文件数量与指定 license 的簇关系。
+
+证据入口：[A4 仓库](https://github.com/stanford-cs336/assignment4-data)、[`wet_files.py`](https://github.com/stanford-cs336/assignment4-data/blob/main/cs336_data/wet_files.py)、[Common Crawl 格式](https://commoncrawl.org/blog/navigating-the-warc-file-format)、[Resiliparse](https://resiliparse.chatnoir.eu/en/stable/)。
+
+<Accordions>
+  <Accordion title="MinHash 结果每次不同">检查是否固定 hash family/seed、是否用了 Python 内置 hash、输入规范化与文件遍历顺序是否稳定。</Accordion>
+  <Accordion title="质量上升但验证 PPL 变差">检查过滤是否过窄、数据域是否偏离验证集、去重是否误删、多样性/token 数是否变化；“更像 Wikipedia”不等于所有目标都更好。</Accordion>
+</Accordions>

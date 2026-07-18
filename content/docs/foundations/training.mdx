@@ -1,0 +1,51 @@
+---
+title: 训练闭环：从 loss 到 checkpoint
+description: 交叉熵、AdamW、学习率、梯度裁剪、数据加载与可复现实验。
+---
+
+## “训练”是一条状态机
+
+每一步：从 token 数组取 `[B,T+1]` → 前 T 个作为输入、后 T 个作为标签 → forward 得 `[B,T,V]` → cross-entropy → backward → 裁剪梯度 → optimizer step → 清梯度。定期评测与保存 checkpoint。
+
+## AdamW 不只是“带动量的 SGD”
+
+Adam 保存梯度一阶矩 `m` 和二阶矩 `v`，做偏差修正后用 `m̂/(sqrt(v̂)+eps)` 给每个参数自适应步长。AdamW 把 weight decay 与梯度更新解耦：
+
+```text
+θ ← θ − lr · m̂/(√v̂+ε) − lr · λθ
+```
+
+常见错误包括：时间步从 0/1 的偏差修正错一位、把 epsilon 放进平方根、原地更新破坏 autograd，以及把 L2 正则混进梯度后再自适应缩放。
+
+## 学习率为什么先热身再余弦下降？
+
+初始优化器统计还不可靠，大步长容易发散，所以线性 warmup；中段用峰值学习率；后段余弦降到最小值，使参数在较小步长下收敛。边界值应写测试：`t=0`、`t=warmup`、`t=cosine_end` 及之后。
+
+## 梯度裁剪
+
+全局 L2 范数 `||g||` 超过阈值 M 时，把所有梯度共同乘 `M/(||g||+eps)`。关键是**共同缩放**，保留参数间梯度方向；不能逐张量各裁各的。
+
+## 数据加载的最小正确实现
+
+把 token 化语料保存成一维 `numpy` memmap。随机选择起点 `s`，输入为 `tokens[s:s+T]`，标签为 `tokens[s+1:s+T+1]`。最大起点必须保证最后一个标签不越界。转换到目标 device 时明确 dtype 为整数索引类型。
+
+## Checkpoint 里要有什么？
+
+至少保存 model state、optimizer state、iteration；实际实验还应保存 config、随机数状态、数据版本和代码 commit。只存模型权重可以推理，却不能无缝恢复优化器动量和学习率位置。
+
+<AssignmentStepper items={[
+  '让一个固定 batch 的 loss 明显下降',
+  '检查 logits/labels shift 没有错位',
+  '验证梯度范数与裁剪前后数值',
+  '保存后加载，确认下一步 loss 完全一致',
+  '记录 tokens/s、MFU 与验证集 loss'
+]} />
+
+## 读图而不是只看最后一个数
+
+- train loss 降、val loss 升：过拟合或分布差异；
+- 两者都不降：实现、数据、学习率或容量问题；
+- loss 突然尖峰：坏 batch、数值不稳定或学习率过大；
+- 吞吐下降而 loss 正常：数据加载、编译重触发、通信或显存压力。
+
+参考 [`tests/test_optimizer.py`](https://github.com/stanford-cs336/assignment1-basics/blob/main/tests/test_optimizer.py)、[`test_data.py`](https://github.com/stanford-cs336/assignment1-basics/blob/main/tests/test_data.py) 和 [`test_serialization.py`](https://github.com/stanford-cs336/assignment1-basics/blob/main/tests/test_serialization.py) 建立最小验收闭环。

@@ -1,0 +1,68 @@
+---
+title: Lectures 15–17 · 后训练、RLVR 与多模态
+description: SFT/偏好/DPO/PPO/GRPO 的数据与目标，再把同一套思路扩展到视觉语言模型。
+---
+
+## Lecture 15：模型从“续写”变成“助手”
+
+### SFT 与 mid-training
+
+SFT 把 prompt+response 拼成序列，只在 response labels 上算 CE。它擅长把预训练已有能力变成可调用的格式/风格，也能教工具 schema 和安全边界；不擅长用少量示范硬塞大量新事实。高质量小数据、多样任务、长短回答和拒答平衡常比盲目数量重要。
+
+mid-training 位于通用预训练与最终 SFT 之间，可用领域文本、长上下文、指令混合平滑分布迁移。阶段边界并非数学必然，关键是数据、目标和学习率变化。
+
+### Preference data
+
+标注者对同 prompt 的回答排序。偏好可能混合 helpfulness、correctness、style、safety；若 rubric 不明确，reward model 学到长度/语气捷径。人类反馈贵且不一致，AI feedback 可扩量，却继承 judge 偏差；Constitutional AI 先给原则再由模型 critique/revise/compare。
+
+Bradley–Terry 把 reward 差转胜率 `σ(r_chosen−r_rejected)`。显式 RLHF 先训练 reward model，再在 KL 约束下用 PPO 优化 policy；reward 只在训练分布附近可靠，过度优化会 reward hacking、mode collapse 或牺牲基础能力。
+
+### DPO 推导直觉
+
+KL 约束最优策略满足 `π*(y|x) ∝ π_ref(y|x) exp(r/β)`，反解 reward 可写为 `β log(π*/π_ref)+β log Z(x)`；把 chosen/rejected reward 差代入偏好 loss 时 `log Z(x)` 抵消，于是无需显式 reward model：
+
+```text
+−log σ(β[(logπθ(yw)−logπref(yw)) − (logπθ(yl)−logπref(yl))])
+```
+
+β 决定相对 reference 的偏好强度。实现必须明确 response log-prob 是求和还是长度归一；reference frozen；chosen/rejected prompt template 完全一致。
+
+## Lecture 16：用可验证奖励训练推理
+
+### 从 REINFORCE 到 PPO
+
+log-derivative trick：`∇E[R]=E[R∇logπ]`。减去与 action 无关的 baseline 不改变期望，却可降方差；advantage 表示相对预期的好坏。PPO 用 old policy 采样、importance ratio 校正，并 clip 大 ratio；actor-critic/GAE 用 learned value 估计 token/状态 advantage，但增加模型与训练复杂度。
+
+### GRPO 与 Dr.GRPO
+
+GRPO 对同一问题采 G 个回答，以组均值/标准差构造 advantage，无需 critic。组内全同 reward 时没有相对信号；除 group std 会让中等难度、低方差组获得不同权重；对 token loss 做 sequence 平均又会偏向短回答。Dr.GRPO 去掉某些 normalizer，目的是消除问题难度/长度的隐式重加权，而不是简单“更大梯度”。
+
+DeepSeek-R1/R1-Zero 展示 outcome reward 可诱导验证、反思和更长推理；工程配方还包含 cold-start SFT、规则 reward、语言/格式处理、拒绝采样与蒸馏。不能把最终行为全归因于一条 GRPO 公式。
+
+### 系统与算法耦合
+
+RL 训练大量时间花在 rollout。policy 更新后生成 server 权重变旧；同步越频繁越 on-policy，却增加传输和 cache flush。长 response 增 KV/生成成本；按长度归一又改变梯度权重。Kimi K1.5 的 curriculum/长度控制、Qwen 3 的 thinking/non-thinking 融合、agentic RL 的环境交互都体现“reward、采样和系统”共同设计。
+
+离线/多 epoch 更新复用 rollout，提高样本效率却产生 off-policy drift。token ratio clipping、sequence 几何平均（GSPO）等在偏差和方差间取舍；必须监控 KL、ratio 分布、clip fraction、entropy、长度和按难度 reward。
+
+## Lecture 17：语言模型如何看见图像
+
+### CLIP 与 SigLIP
+
+图像 encoder 把 patch 变 embedding，文本 encoder 编码描述。CLIP 在 batch 内做双向对比 softmax：配对图文相似、其他组合为负例；batch 越大负例越多，但全局 softmax 需要跨设备 gather。SigLIP 对每个 pair 做 sigmoid 二分类，降低对巨大 batch/global normalization 的依赖。
+
+### LLaVA 路线
+
+LLaVA 用预训练 vision encoder，projector 把视觉 feature 映射到 LLM embedding 空间。阶段一用图文对齐训练 projector，阶段二用多模态 instruction SFT 调整回答。LLaVA-OneVision/AnyRes 把不同分辨率切 tile 并保留全局图；token 数、空间布局与重复区域需要平衡。
+
+Qwen2-VL 用 dynamic resolution，使视觉 token 随原始尺寸变化；MRoPE 把 position 维拆到 temporal/height/width；Qwen3-VL/DeepStack 将多层视觉特征注入语言模型。模型“能看大图”不只由 context 决定，还受训练分辨率分布、OCR 数据、位置编码外推和视觉 token budget 影响。
+
+### 统一理解与生成
+
+VQ-VAE 用 encoder 把图像量化为离散 codebook id，decoder 还原图像。Chameleon 等把视觉 code 与文本 token 放入同一自回归序列，可统一预测；代价是 codebook 重建损失、序列很长、不同模态统计不平衡。连续视觉 embedding 更适合理解，离散 token 更自然支持生成，混合系统会组合两者。
+
+## 把三讲连起来
+
+多模态模型同样需要 pretraining → instruction SFT → preference/RL，且数据和评测更脆弱：图文版权/隐私、OCR 噪声、空间幻觉、视觉 prompt injection、安全拒答。CS336 前 16 讲的 tokenizer、系统、数据、评测与对齐思维并没有失效，只是“token”不再全是文字。
+
+进一步阅读：[Learning to Summarize from Human Feedback](https://arxiv.org/abs/2009.01325)、[Constitutional AI](https://arxiv.org/abs/2212.08073)、[Kimi k1.5](https://arxiv.org/abs/2501.12599)、[LLaVA-OneVision](https://arxiv.org/abs/2408.03326)、[Chameleon](https://arxiv.org/abs/2405.09818)。

@@ -1,0 +1,51 @@
+---
+title: Tokenization：文字如何变成整数
+description: 从 UTF-8 字节到 BPE，理解 Assignment 1 的第一条主线。
+---
+
+## 为什么不直接按“词”切？
+
+模型只能接收有限词表中的整数。按词切会遇到未登录词、拼写变化和多语言；按字符/字节不会 OOV，但序列变长，attention 成本随 `T²` 增长。BPE（Byte Pair Encoding）在两端折中：从 256 个字节和特殊 token 出发，反复合并语料中最常见的相邻 token 对。
+
+<Callout type="info" title="Byte 与字符不是一回事">
+  UTF-8 中英文字符通常占 3 个字节；Python `str` 是 Unicode 字符序列，`bytes` 才是 0–255。BPE 词表用 bytes 可保证任意文本都能编码。
+</Callout>
+
+## 训练 BPE：一次合并发生了什么
+
+语料预分词后，统计所有相邻 pair 的频次。找到最高频 `(a,b)`，为 `a+b` 分配新 token id，在所有词片段中替换该 pair，再更新受影响的计数，直到词表达到目标大小。
+
+```text
+初始: l o w </w>   l o w e r </w>
+计数最高: (l,o) → 合并 lo
+下一轮: lo w </w>  lo w e r </w>
+```
+
+朴素实现每轮重新扫描全部语料，复杂度高。作业鼓励你先写**正确基线**，再用“pair → 出现位置/词”的倒排索引只更新局部。优化前必须保存确定性：并列 pair 使用题面规定的字典序规则。
+
+## 特殊 token 为什么要先切开？
+
+`<|endoftext|>` 必须作为不可拆分的原子。若先让普通预分词正则处理，它可能被拆成标点和字母；更麻烦的是特殊 token 前后文本会被错误连接。正确思路是用转义后的特殊 token 模式切分，丢弃匹配项参与普通统计，再按需把它作为独立 id 输出。
+
+## 编码与解码
+
+- `encode`：普通文本先转 bytes、预分词，再按训练所得 merge **优先级**合并；不能只看最终词表。
+- `decode`：id → bytes，拼接后用 UTF-8 解码；对非法序列采用题面指定的错误策略。
+- `encode_iterable`：流式处理大文件，避免一次把语料全读入内存。
+
+## 与 Assignment 1 对照
+
+官方学生仓库的 [`tests/test_train_bpe.py`](https://github.com/stanford-cs336/assignment1-basics/blob/main/tests/test_train_bpe.py) 检查词表、merge 顺序、特殊 token 与速度；[`tests/test_tokenizer.py`](https://github.com/stanford-cs336/assignment1-basics/blob/main/tests/test_tokenizer.py) 检查 round-trip、GPT-2 兼容和迭代编码。入口契约集中在 [`tests/adapters.py`](https://github.com/stanford-cs336/assignment1-basics/blob/main/tests/adapters.py)。
+
+<CheckpointQuiz
+  question="BPE 训练为何从 UTF-8 字节开始，而不是只从常见汉字和英文字符开始？"
+  options={['字节让模型自动变大', '字节词表能无损覆盖任意输入，不产生未知字符', 'UTF-8 总让序列更短', '这样不需要 merge']}
+  answer={1}
+  explanation="256 个基础字节构成完备后备词表；BPE merge 再负责把常见字节串压缩成更短 token。"
+/>
+
+## 必读材料
+
+- [Neural Machine Translation of Rare Words with Subword Units](https://arxiv.org/abs/1508.07909)：BPE 进入神经 NLP 的经典论文。
+- [GPT-2 tokenizer 源码](https://github.com/openai/gpt-2/blob/master/src/encoder.py)：短小但重要；先自己实现再对照。
+- [CS336 lecture 1](https://github.com/stanford-cs336/lectures/blob/main/lecture_01.py)：课程用压缩率、词表大小与计算效率解释 tokenizer，而非只讲算法步骤。

@@ -1,0 +1,52 @@
+---
+title: 必读论文与源码路线
+description: 不堆链接：告诉你每篇为什么读、读到哪里、怎样与作业互证。
+---
+
+## 第一层：造出模型
+
+| 材料 | 为什么读 | 建议抓住 |
+|---|---|---|
+| [Attention Is All You Need](https://arxiv.org/abs/1706.03762) | Transformer 起点 | scaled dot-product、multi-head、残差；辨认与现代 decoder 差异 |
+| [BPE for NMT](https://arxiv.org/abs/1508.07909) | 子词算法来源 | rare word 问题与 merge；再回看字节级改造 |
+| [RMSNorm](https://arxiv.org/abs/1910.07467) | A1 归一化 | 去掉 re-centering 后保留什么 |
+| [RoFormer](https://arxiv.org/abs/2104.09864) | RoPE | `R(m)ᵀR(n)` 如何只依赖相对位移 |
+| [GLU Variants](https://arxiv.org/abs/2002.05202) | SwiGLU | 门控与参数预算公平比较 |
+| [AdamW](https://arxiv.org/abs/1711.05101) | 优化器 | L2 与 decoupled weight decay 的更新差异 |
+
+源码顺序：课程 [`lecture_01.py`](https://github.com/stanford-cs336/lectures/blob/main/lecture_01.py) → A1 tests/adapters → 自己实现 → [GPT-2 tokenizer](https://github.com/openai/gpt-2/blob/master/src/encoder.py) / [Llama 3 model.py](https://github.com/meta-llama/llama3/blob/main/llama/model.py) 对照。先做后看，避免“看懂了”错觉。
+
+## 第二层：让它有效率
+
+| 材料 | 核心问题 |
+|---|---|
+| [FlashAttention](https://arxiv.org/abs/2205.14135) / [FA2](https://arxiv.org/abs/2307.08691) | attention 的 IO 复杂度与在线 softmax |
+| [ZeRO](https://arxiv.org/abs/1910.02054) | 三类模型状态怎样逐级分片 |
+| [Megatron-LM](https://arxiv.org/abs/1909.08053) | MLP/attention 矩阵如何切成 tensor parallel |
+| [vLLM](https://arxiv.org/abs/2309.06180) | KV cache 如何像虚拟内存一样分页 |
+
+配套源码：[Triton tutorials](https://triton-lang.org/main/getting-started/tutorials/index.html)、[PyTorch FSDP](https://github.com/pytorch/pytorch/tree/main/torch/distributed/fsdp)、[vLLM](https://github.com/vllm-project/vllm)。阅读大型仓库时先找数据结构与一次请求/一步训练的调用链，不要从文件树第一个文件开始。
+
+## 第三层：规模与数据
+
+- [Kaplan Scaling Laws](https://arxiv.org/abs/2001.08361)：读经验模型、compute-optimal 推导和限制。
+- [Chinchilla](https://arxiv.org/abs/2203.15556)：对比三种拟合方式，重点看 IsoFLOP。
+- [μP](https://arxiv.org/abs/2203.03466)：先理解目标，再读严格 tensor program 推导。
+- [Dolma](https://arxiv.org/abs/2402.00159) + [toolkit](https://github.com/allenai/dolma)：数据谱系、过滤组件与可复现管线。
+- [DCLM](https://arxiv.org/abs/2406.11794)：固定训练 recipe 下怎样把数据选择变成可比较实验。
+- [Deduplicating Training Data](https://arxiv.org/abs/2107.06499)：去重如何影响记忆、污染与效率。
+
+## 第四层：后训练
+
+| 材料 | 阅读问题 |
+|---|---|
+| [InstructGPT](https://arxiv.org/abs/2203.02155) | SFT/RM/PPO 各自的数据和目标是什么？ |
+| [DPO](https://arxiv.org/abs/2305.18290) | 如何从 KL 约束最优策略消去显式 reward model？ |
+| [PPO](https://arxiv.org/abs/1707.06347) | importance ratio clipping 解决什么，又引入什么偏差？ |
+| [DeepSeekMath](https://arxiv.org/abs/2402.03300) | GRPO 如何不用 critic？ |
+| [DeepSeek-R1](https://arxiv.org/abs/2501.12948) | 可验证奖励怎样诱导长链推理？哪些结论依赖大规模系统？ |
+| [Dr. GRPO](https://arxiv.org/abs/2503.20783) | group std 与长度归一如何重加权训练样本？ |
+
+## 三遍论文法
+
+第一遍只读摘要、图和结论，写一句“它解决什么”；第二遍跟公式/算法，拿课程里的小 shape 手算；第三遍读实验和局限，尝试用作业测试或微实验复现一个主张。没有复现条件时，明确写“论文报告”，不要把它伪装成自己的观察。

@@ -1,0 +1,74 @@
+---
+title: Lectures 9–11 · 缩放与推理
+description: 幂律、Chinchilla 三种拟合、prefill/decode 资源账本，以及 μP/WSD 的实战边界。
+---
+
+## Lecture 9：Scaling law 在测什么？
+
+“更多数据/参数通常更好”不够指导预算。经验上 loss 对 N、D、C 呈幂律加不可约项；在 log-log 图里近似直线，意味着每增加固定倍数资源获得相似的 loss 改善，而不是固定绝对改善。
+
+### Data scaling 与重复
+
+独立同分布数据增加可降低泛化误差；重复相同数据的收益远小于新 token，过多 epoch 会过拟合/记忆。训练分布与目标分布不一致时，单纯扩大 D 可能沿错误方向优化。tokenizer 和质量过滤改变“一个 token 的信息量”，所以 D 不是跨配方绝对单位。
+
+### 参数、架构和 optimizer
+
+N 需明确是否含 embedding；同 N 的深/宽、head、FFN、MoE 激活参数不同，训练效率和质量也不同。critical batch size 以上继续增 batch 会降低样本效率；optimizer、LR schedule 和训练稳定性若没有为各规模调好，会把“recipe 没缩放”误判成模型 scaling 差。
+
+### Chinchilla 的三种分析
+
+1. 对每个 N 拟合训练曲线，在不同 C 处取最优；
+2. IsoFLOP：固定 C，扫描 N/D 找最低点，再拟合 frontier；
+3. 联合拟合 `L(N,D)=E+A/N^α+B/D^β`。
+
+三种方法有不同归纳偏置。IsoFLOP 直观但需要每条曲线包住谷底；联合拟合利用全部点但对函数形式/异常点敏感。外推比拟合区间大几个数量级时，报告区间与敏感性，不给伪精确小数。
+
+## Lecture 10：推理为何与训练不同
+
+### Prefill
+
+prompt 的 T 个 token 可并行，MLP matmul 的有效 batch 是 B×T，权重被大量复用；attention 对 prompt 形成 T×T。通常计算密集，目标是高吞吐和较低 TTFT。
+
+### Decode
+
+每步只有 B 个新 token，却要流过所有层权重，并读取历史 KV；大矩阵退化成较“瘦”的 matmul，权重复用低，常受 HBM 带宽限制。增加 batch 可摊权重读取、提高吞吐，但增加排队与 KV 占用，伤单请求延迟。
+
+KV cache 元素量近似：
+
+```text
+B × sequence × layers × kv_heads × head_dim × 2(K,V)
+```
+
+再乘 dtype bytes。GQA/MQA、local attention、cross-layer attention、MLA 等都在减少 kv_heads、保存长度或低秩维度；必须同时看质量与 kernel 支持。
+
+### 权重和调度优化
+
+量化用 INT8/FP8/INT4 减少权重 bytes；weight-only quantization 对 decode 尤其有效，但反量化 kernel 和 outlier 会决定实际速度/质量。AWQ 根据激活保护重要权重通道。剪枝改变结构，蒸馏用大模型 soft target/数据训练小模型。
+
+Speculative decoding 让小 draft 一次提议多个 token，大 target 并行验证，并用拒绝采样保持目标分布精确；收益取决于接受率与两模型成本。continuous batching 在请求完成/到达时动态重组 batch；PagedAttention 像虚拟内存页管理不同长度 KV，减少预留与碎片。
+
+服务报告应分 TTFT、TPOT/inter-token latency、端到端 latency、request/s、token/s 和显存，不能用一个吞吐数代表体验。
+
+## Lecture 11：Scaling recipe 自己也要可缩放
+
+### μP 的目标
+
+Standard parameterization 下，宽度改变会让不同矩阵的激活、梯度和更新相对尺度漂移，最佳 LR 随宽度变。μP 为输入、隐藏、输出层设置不同初始化/学习率 scaling，使宽度趋大时激活 O(1)、每层更新有非退化极限，于是小 proxy model 的 LR 等超参更可能迁移。
+
+这不是“加一个库就自动成立”。RMSNorm gain、强 weight decay、某些 optimizer、深度/头数变化或不符合推导的参数共享都可能破坏迁移。实践中画不同宽度的 LR sweep：若最优点和曲线形状不稳定，先修 recipe 再做昂贵 scaling fit。
+
+### WSD schedule
+
+Warmup–Stable–Decay 先 warmup 到稳定 LR，长时间保持，再在末段 decay。多个预算实验可共享/复用 stable checkpoint，从不同位置分叉 decay，避免每条曲线从头训练；也便于在训练中途决定延长 token budget。比较时必须对齐已见 token 和 decay 位置，不能拿 stable 中途 loss 与完整 decay 后 loss 混比。
+
+### 工业 scaling 报告怎么读
+
+MiniCPM、DeepSeek、Qwen、Kimi、Hunyuan、Llama 3 等公开不同程度的参数/数据/optimizer scaling。读表时标出：目标 metric、数据是否固定、模型族是否同构、超参是否迁移、是否报告失败点、拟合跨度和外推跨度。只展示最终配方的技术报告无法证明每个组件的独立贡献。
+
+Muon 等矩阵 optimizer 对更新做正交化/谱方向处理，可能改变宽度和 batch scaling。新 optimizer 先比较相同 compute/time 与稳定性，再谈最终 loss；单步更贵也可能因更少 step 获益。
+
+## 三讲合起来的决策框架
+
+训练端选择 N/D/recipe，推理端给 latency/memory 约束，二者共同决定“最佳模型”。compute-optimal 预训练模型未必 inference-optimal：更小且多训数据的模型可能训练更贵，却长期服务更便宜。A3 让你练训练预算决策；Lecture 10 提醒最终部署是另一个目标函数。
+
+进一步阅读：[Chinchilla](https://arxiv.org/abs/2203.15556)、[Tensor Programs V / μP](https://arxiv.org/abs/2203.03466)、[Speculative Decoding](https://arxiv.org/abs/2211.17192)、[AWQ](https://arxiv.org/abs/2306.00978)。
