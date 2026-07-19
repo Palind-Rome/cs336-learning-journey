@@ -928,13 +928,11 @@ $$N_{DP}\le 1+\frac{BW}{C}.$$
 
 forward 先 all-gather 权重：
 
-$$T^{fwd}_{comp}=\frac{6BDD_{FF}}{N_{FSDP}C},\quad
-T^{fwd}_{comm}=\frac{N_{FSDP}-1}{N_{FSDP}}\frac{6DD_{FF}}{W}.$$
+$$T^{fwd}_{comp}=\frac{6BDD_{FF}}{N_{FSDP}C},\quad T^{fwd}_{comm}=\frac{N_{FSDP}-1}{N_{FSDP}}\frac{6DD_{FF}}{W}.$$
 
 backward 既 all-gather 权重又 reduce-scatter 梯度：
 
-$$T^{bwd}_{comp}=\frac{12BDD_{FF}}{N_{FSDP}C},\quad
-T^{bwd}_{comm}=2\frac{N_{FSDP}-1}{N_{FSDP}}\frac{6DD_{FF}}{W}.$$
+$$T^{bwd}_{comp}=\frac{12BDD_{FF}}{N_{FSDP}C},\quad T^{bwd}_{comm}=2\frac{N_{FSDP}-1}{N_{FSDP}}\frac{6DD_{FF}}{W}.$$
 
 两边都得到 $N_{FSDP}\le1+BW/C$。
 
@@ -971,13 +969,11 @@ $$T_{comp}=\frac{6BDD_{FF}}{N_{TP}N_{FSDP}C}.$$
 
 FSDP 轴只搬运当前 TP shard 的权重，TP 轴只搬运当前 FSDP batch shard 的 activation：
 
-$$T_{FSDP}=\frac{N_{FSDP}-1}{N_{FSDP}}\frac{6DD_{FF}}{N_{TP}W},\qquad
-T_{TP}=2\frac{N_{TP}-1}{N_{TP}}\frac{2BD}{N_{FSDP}W}.$$
+$$T_{FSDP}=\frac{N_{FSDP}-1}{N_{FSDP}}\frac{6DD_{FF}}{N_{TP}W},\qquad T_{TP}=2\frac{N_{TP}-1}{N_{TP}}\frac{2BD}{N_{FSDP}W}.$$
 
 若两条网络轴可以重叠，通信关键路径是 `max(T_FSDP, T_TP)`，可分别把两轴推到：
 
-$$N_{FSDP}\le1+\frac{BW}{C},\qquad
-N_{TP}\le1+\frac{3D_{FF}W}{2C}.$$
+$$N_{FSDP}\le1+\frac{BW}{C},\qquad N_{TP}\le1+\frac{3D_{FF}W}{2C}.$$
 
 若共享网络、不能重叠，必须用 `T_FSDP + T_TP`。忽略有限 $N$ 的 `-1`，最优点把通信预算一半给每条轴：$N_{FSDP}\approx BW/(2C)$、$N_{TP}\approx3D_{FF}W/(4C)$，因此：
 
