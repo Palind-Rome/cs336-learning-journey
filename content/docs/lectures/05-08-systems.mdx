@@ -5,77 +5,603 @@ description: 从芯片存储层次、Triton kernel，到 collectives、ZeRO/FSDP
 
 ## Lecture 5：把 GPU 看成数据搬运机器
 
-GPU 由多个 SM 组成；thread 按 warp 锁步执行，block 被调度到 SM。寄存器最快且私有，shared memory/SRAM 由 block 协作，L2 跨 SM，HBM 容量大却远。Tensor Core 擅长固定 tile 的低精度矩阵乘。
+“GPU 有很多 FLOPs”不是性能解释。真正的问题是：这些计算单元是否持续拿得到数据？现代 GPU 的 matmul 峰值增长快于显存带宽，所以训练工程越来越像一门数据搬运学。
 
-### 五类性能陷阱
+<TermDeck
+  title="GPU 执行模型"
+  items={[
+    { term: 'SM', expansion: 'Streaming Multiprocessor', chinese: '流式多处理器', explanation: 'GPU 上独立调度 thread blocks 的计算簇，内部有 scalar cores、Tensor Cores、register file 与 shared memory。' },
+    { term: 'SIMT', expansion: 'Single Instruction, Multiple Threads', chinese: '单指令多线程', explanation: '同一个 kernel 指令流作用于许多线程的不同数据；warp 内分支不一致时要分路径执行。' },
+    { term: 'Warp', expansion: 'Warp', chinese: '32 线程执行组', explanation: 'CUDA 中 32 个连续 thread 作为硬件调度单位锁步推进；coalescing 和 divergence 都以 warp 为核心。' },
+    { term: 'SRAM', expansion: 'Static Random-Access Memory', chinese: '静态随机存储器', explanation: '用于 register/cache/shared memory 的片上高速存储，面积昂贵、容量小，但远快于 HBM/DRAM。' },
+    { term: 'HBM', expansion: 'High Bandwidth Memory', chinese: '高带宽显存', explanation: 'GPU 封装旁的大容量全局内存。带宽虽高，和 Tensor Core 的算力相比仍常是瓶颈。' },
+    { term: 'TC', expansion: 'Tensor Core', chinese: '张量核心', explanation: '专门执行固定形状低/混合精度矩阵乘累加的电路，matmul 吞吐可远高于普通浮点指令。' },
+  ]}
+/>
 
-1. **分支发散**：同 warp 走不同路径，硬件串行执行分支；
-2. **非合并访问**：相邻线程访问离散地址，内存事务浪费；
-3. **低 occupancy**：每 block 寄存器/shared memory 过多，SM 同时驻留 block 少；
-4. **wave quantization**：block 数不能均匀填满所有 SM，最后一波利用率低；
-5. **小 kernel 洪水**：启动/同步成本超过实际算术。
+### 1. 从 CPU 的 latency 思维切到 GPU 的 throughput 思维
 
-Tiling 的目标是把 Q/K/V 或 matmul 子块搬入片上后多次使用；fusion 把 bias/activation/norm 等留在寄存器，避免写回 HBM；recomputation 有时“多算一次反而更快”，因为 FLOPs 便宜而 IO 昂贵。
+CPU 用复杂控制、分支预测和大 cache 让少数线程尽快结束；GPU 用很多轻量计算单元让海量相同工作总体完成得快。CUDA 层次是：
 
-### FlashAttention 的分块不变量
+- **thread**：处理一个或少量元素，有私有 registers；
+- **warp**：32 个连续 thread 的硬件执行组；
+- **block**：若干 warps，被完整调度到一个 SM，可共享 shared memory；
+- **grid**：一次 kernel 的所有 blocks。
 
-对每个 query row，softmax 需要全局最大值和分母。遍历 key blocks 时维护 `(m,l,o)`。新块局部最大 `m_b` 到来，设 `m_new=max(m_old,m_b)`：
+跨 block 的数据通常必须经 global memory 或另一个 kernel/synchronization 交换。内存从近到远约是 register → shared/L1 → L2 → HBM；越近越小、越贵、越快。GPU 与 TPU 高层都包含轻量控制、大 matmul 单元和高速片上存储；差异还在 SM/TC 数量、warp 模型和多设备网络。
 
-```text
-l_new = exp(m_old-m_new)·l_old + Σ exp(score_b-m_new)
-o_new = exp(m_old-m_new)·o_old + exp(score_b-m_new)·V_b
-```
+### 2. 六个让工作负载变快的旋钮
 
-结束后 `O=o/l`。完整 T×T 不落 HBM；backward 可用保存的 row LSE 和输出重算概率，以计算换 IO。
+1. **控制分支发散。** warp 中一部分线程走 if、一部分走 else 时，两条路径通常被掩码串行执行。条件本身允许存在，但热循环中的不规则分支会损失并行利用。
+2. **低精度。** fp16/bf16 让相同元素搬运字节减半，并触发 Tensor Core；FP8/FP4 还需 block scaling、转置量化和数值校准。
+3. **operator fusion。** 把多个逐元素算子放进一个 kernel，中间值留 register/shared memory，不在每步写回 HBM。<code>sin(x)^2+cos(x)^2</code> 的朴素图可能发 5 个 kernel，融合后只需一次读写。
+4. **recomputation。** 丢弃便宜中间量，反向时重算。三层 sigmoid 的例子中，重算可把内存读写降为原先 5/8；多做 FLOPs 反而更快。
+5. **coalescing。** 一个 warp 的地址应落在尽量少的 DRAM burst/cache line 中。判断的是 **相邻 lane 的地址**，不是“代码看起来是否顺序”。
+6. **tiling。** 把矩阵小块协同搬到 shared memory/register，多个 MAC 复用同一份数据，再换下一 K tile。
+
+低精度同时改变 Roofline 的两侧：每元素 bytes 更少，Tensor Core 峰值更高。讲义的 ReLU 例子把 fp32 记为每 FLOP 约 8 bytes 读写，fp16 约 4 bytes；注意有些文献把算术强度写 FLOPs/byte，本页用了倒数 bytes/FLOP，比较时必须看单位。
+
+MXFP8 在 Blackwell 上通常用 E4M3 数据和每 32 项一个 E8M0 scale。转置不再只是改变 stride：按原轴分组的 scale 对转置后分组不适用，因此训练会维护/重新量化转置副本。MXFP4 只有很少可表示值，约每 16 项配 E4M3 scale。
+
+### 3. Tiling 的精确收益与边界代价
+
+朴素 n×n matmul 中，一个输入元素可从 global memory 重读 n 次；tile 边长 T 时，每次从 global 读入后在 tile 内复用 T 次，因此全局读取近似降 T 倍。典型 K-loop：
+
+~~~text
+for k_tile:
+  cooperative load A_tile, B_tile → shared memory
+  synchronize block
+  accumulator += A_tile @ B_tile
+  synchronize before overwriting shared memory
+store accumulator once
+~~~
+
+tile 不是越大越好。它受 shared memory、register pressure、warps/SM、矩阵整除性和 burst alignment 共同限制。边界 tile 需要 mask/padding；大 tile 提高复用，却可能让一个 block 占满资源、降低 occupancy。
+
+**Wave quantization** 是另一种阶梯效应。若 kernel 生成 98 blocks、A100 有 108 SM，理想上一波完成；矩阵从 1792 增至 1793，边界取整可能让 tile 数从 7×14=98 跳到 8×15=120，于是 108 blocks 第一波、12 blocks 第二波，第二波大部分 SM 空闲。只增加一个维度，时延却突然跳升。
+
+### 4. FlashAttention：不把 S×S 中间矩阵写进 HBM
+
+标准 attention 有 Q/K/V projection、<code>S=QKᵀ</code>、softmax、<code>PV</code>。FlashAttention 不是减少数学 FLOPs 的近似 attention，而是 IO-aware 的精确重排：
+
+1. 载入 Q block，并逐个载入 K/V blocks；
+2. 在片上算局部 score；
+3. 就地融合 mask、scale、exp；
+4. 用 online softmax 合并局部分母与 value 加权和；
+5. 最终只写 O，而不把完整 score/probability 矩阵落到 HBM。
+
+对一个 query row，遍历 key blocks 时保存运行最大值 m、指数和 l、未归一化输出向量 o。新 block 分数 sb 到来：
+
+$$
+m' = \max(m,\max s_b),
+$$
+
+$$
+l' = e^{m-m'}l + \sum_j e^{s_{b,j}-m'},
+$$
+
+$$
+o' = e^{m-m'}o + \sum_j e^{s_{b,j}-m'}v_{b,j}.
+$$
+
+旧量都乘 <code>exp(m−m')</code>，正是把旧基准最大值换到新基准；这形成 telescoping rescale。结束输出 <code>o/l</code>。causal mask 或边界 padding 的分数必须置 −∞，使 exp 后贡献 0。
+
+<ExecutionTrace
+  title="Online softmax 合并两个 score blocks"
+  steps={[
+    { label: '块 A', title: '计算第一个局部最大值', input: 'scores A = [2, 1]', output: 'm=2, l=1+e⁻¹', explanation: '先减局部 max，避免 exp 溢出；同时累计 exp(score)·V。' },
+    { label: '块 B', title: '第二块出现更大分数', input: 'scores B = [4, 0]', output: 'm′=4', explanation: '全局基准从 2 改为 4，旧块贡献必须乘 e^(2−4)。' },
+    { label: '重标', title: '旧分母与旧输出同步缩放', input: 'l_old, o_old', output: 'e⁻²·l_old, e⁻²·o_old', explanation: '分母和分子用同一比例，最后归一化结果保持精确。' },
+    { label: '合并', title: '加上新块贡献', input: 'exp([4,0]−4)', output: 'l_new, o_new', explanation: '所有 blocks 遍历完才做 o/l；从未物化完整 S×S probabilities。' },
+  ]}
+/>
+
+backward 需要 softmax 概率，但可以保存每 row 的 log-sum-exp 和 forward 输出，再按 K/V tile 重算 score/probability；它用更多 compute 换掉 O(S²) HBM 激活。这也是 recomputation 与 fusion 在真实算法中的组合。
+
+### Lecture 5 PDF 中文全文（55 页，按页序）
+
+**第 1–4 页。** 标题为 GPUs。目标是让 CUDA/GPU 不再神秘，理解 GPU 何时变慢、怎样构造快速算法。讲义致谢 Horace He 博客、CUDA Mode、TPU/GPU scaling book、nichijou.co 与 Jonathan Hui 等来源。全讲分三部分：GPU 结构、GPU 性能、用这些知识拆解 FlashAttention。
+
+**第 5–8 页。** scaling laws 显示更多 compute 往往带来可预测的 LM 性能提升；更快硬件、更好利用率与并行本身目前仍能推动进展。1980–2000 年的 Dennard scaling 已耗尽，但 GPU parallel scaling 十年超过 1000 倍；没有 GPU scaling 就没有 LLM scaling。CPU 优化少数快线程和单线程 latency，GPU 用大量小 ALU、较少分支控制/cache，优化总吞吐。
+
+**第 9–12 页。** GPU 有许多 SM，每个独立执行 blocks；SM 内有许多 streaming processors 执行 threads。越靠近 SM 的 memory 越快：L1/shared 在 SM 内，L2 在 die 上，global memory 是 GPU 旁的芯片；SRAM 约贵 100 倍但可约快 8 倍于 DRAM。执行模型的三类角色：thread 并行执行相同指令、不同输入（SIMT）；block 是共享 SM/shared memory 的 thread 组；warp 是 32 个连续 thread 的执行组。每 thread 可访问自己的 register 和 block 内 shared memory，跨 block 信息通常要读写慢 global memory。
+
+**第 13–18 页。** GPU、TPU 与其他 accelerator 高层相似：轻控制、大而快的 matmul unit、快 memory。GPU 通常 SM 更多，TPU Tensor Core/systolic 类单元更少但大，matmul 性能相近；差异还包括互联方式，以及 TPU 没有同样 warp 模型。GPU 优势是加 SM 就能扩困难工作、SIMT 相对易编程、thread 轻量可停启。早期 NVIDIA programmable shader 被研究者“借来”做 matmul；Volta/Turing 后 Tensor Core 是专用矩阵乘电路，matmul 比普通浮点操作快十倍以上。compute 增长快于 memory，难点是持续喂饱计算单元。总结：GPU 大规模同指令并行，matmul 扩展尤其快，必须尊重内存层次。
+
+**第 19–23 页。** 即便方阵 matmul，GPU 性能也复杂。Roofline 用来判断性能，核心问题是避免 memory-bound。六种方法是控制 divergence、低精度、fusion、recomputation、coalescing、tiling。warp 内每 thread 执行同一指令；conditional 可以用，但执行模型带来显著 overhead。低精度意味着更少 bits 搬运。ReLU 向量在 fp32 下每元素一次读和一次写共 8 bytes、一次比较；fp16 共 4 bytes，因此 bytes/FLOP 减半。
+
+**第 24–28 页。** 现代 GPU 许多操作通过低/混合精度和 Tensor Core 加速。FP8 有范围/精度取舍；Blackwell MXFP8 使用更多 scale，所以可偏向 E4M3 mantissa，每 32 项一个 E8M0 FP8 scale，转置变得不平凡。实践中并非所有 weights 都是 MXFP8，转置也独立量化。MXFP4 可表示的值极少，每 16 项一个 E4M3 scale。
+
+**第 29–34 页。** operator fusion 把 GPU 比作工厂、memory 比作仓库；compute 扩展而运输没同步扩展，反复送回很浪费。朴素多个操作每步读写，fused kernel 一次读入、连续算、一次写出。计算 sin²x+cos²x 朴素启动 5 个 CUDA kernels，所有 pointwise ops 可融合为一次；torch.compile 能自动完成这类容易 fusion。backprop 通常保存黄色 activations 并计算绿色 Jacobians；堆叠三个 sigmoid 会产生 8 次 memory read/write、算术强度很低。丢弃 activation 并反向重算可只需 5/8 的 memory access，丢弃计算有时反而最优。
+
+**第 35–40 页。** DRAM global memory 用 burst mode，一次读给许多 bytes，源于把整行慢速复制到 sense amplifier。若 warp 所有 thread 的地址落在同一/相邻 burst，访问可 coalesce；warp 是 block 内 32 个连续 thread，内存访问一起发生。矩阵乘中必须按 row-major 实际地址安排 lane，错误方向会不合并并重复读向量。Tiling 通过分组/排序 threads 减少 global access：切小 tiles 到 shared memory，分 phase 载入 A/B tile、算 partial sums、换下一 K tile。重复读改从 shared 而非 global，且载入可 coalesce。
+
+**第 41–47 页。** 非 tiled matmul 每个输入从 global 读 n 次；tile T 后从 global 约读 n/T 次、tile 内复用 T 次，全局访问降 T 倍。复杂性包括 tile 不整除矩阵造成低利用率；tile 受 coalescing、shared memory 大小、维度可整除性影响。DRAM 按 burst，tile 与矩阵对齐时载入快；某些维度不可能自然 coalesce，只能 padding。矩阵越大为何可能更快，要由 compute intensity、tiling alignment 与 wave quantization共同解释。1792 维在 256×128 tile 下有 7×14=98 tiles；1793 取整为 8×15=120，A100 108 SM 无法一波完成全部，出现周期时延跳跃。
+
+**第 48 页。** 第二部分总结：以 coalescing/fusion 减 memory access，以 tiling 把数据移到 shared memory，以 quantization/recomputation 用精度或额外 compute 换 memory。
+
+**第 49–55 页。** 第三部分用上述知识理解 FlashAttention。它显著加速 attention；普通 attention 是 Q/K/V 相关矩阵乘，中间有 softmax。论文图 1 本质是 QKV/score/output matmul 的 tiling，问题是 softmax 需要整行。Mikailov 与 Gimelshein 2018 的 online softmax 逐块更新 max，并构造 telescoping sum，从而 tile-by-tile 精确计算 softmax。Dao 2023 的 forward 包含 score S 的 tile 计算、exp fusion、online softmax 与 output tile 计算；backward 不展开，但逐 tile 重算。全讲总结：硬件算力 scaling 与底层细节共同决定哪些方法可扩；GPU compute 强迫我们围绕 matmul 与数据移动思考；认真处理 coalescing、tiling、fusion 才能获得好性能。
 
 ## Lecture 6：正确 benchmark → profile → kernel
 
-课程从 naive/builtin/`torch.compile` GeLU 对照开始，再写 Triton GeLU、fused row softmax、长行 reduction、tiled matmul+ReLU。这条顺序体现工程纪律：先有 oracle 和分布扫描，再写底层实现。
+这一讲把“我写了一个 kernel”变成可证伪的工程流程：先定义正确性 oracle，再 benchmark 端到端趋势，再 profile 实际 kernel，最后才决定是否写 Triton。源码依次实现 elementwise GeLU、单 block row softmax、跨 tile row sum、tiled matmul+ReLU，复杂度逐步增加。
 
-Triton 中 `program_id` 指定一个 program instance；grid 决定总 program 数。pointer = base + 多维 index×stride；越界 lane 用 mask。`BLOCK_SIZE` 常取 2 的幂以适配 reduction，但 padding lane 必须用 `-inf/0` 等正确 identity。matmul 需要沿 K 循环 tile，用 FP32 accumulator，再 cast 输出。
+<TermDeck
+  title="Kernel 工程缩写"
+  items={[
+    { term: 'CTA', expansion: 'Cooperative Thread Array', chinese: '协作线程数组', explanation: 'CUDA 对 thread block 的另一名称；同一 CTA 驻留一个 SM 并共享 shared memory。' },
+    { term: 'PTX', expansion: 'Parallel Thread Execution', chinese: '并行线程执行中间指令集', explanation: 'CUDA/Triton 编译后的虚拟 GPU ISA；还能继续针对具体 SM 架构编译成机器码。' },
+    { term: 'JIT', expansion: 'Just-In-Time Compilation', chinese: '即时编译', explanation: '首次遇到特定 shape/dtype/meta-parameters 时编译 kernel；若不 warm up，会把编译时间误算进稳态执行。' },
+    { term: 'CUTLASS', expansion: 'CUDA Templates for Linear Algebra Subroutines', chinese: 'NVIDIA 线性代数模板库', explanation: '许多 PyTorch GEMM kernel 名称以 cutlass 开头；profile 名还会暴露架构、dtype 与 tile shape。' },
+    { term: 'PT2', expansion: 'PyTorch 2 Compiler', chinese: 'PyTorch 2 编译栈', explanation: 'torch.compile 可捕获算子图、生成融合 Triton kernel；朴素 Python 表达式不一定最终仍是多个 kernels。' },
+  ]}
+/>
 
-### Benchmark 清单
+### 1. Benchmark 回答“多快”，profile 回答“时间花在哪”
 
-- 固定随机种子和输入分布；
-- warmup 覆盖 JIT/allocator；
-- CUDA event 或明确 synchronize；
-- 报 median/quantile 而不只一次；
-- 扫 shape/dtype/causal；
-- 比正确性、峰值内存和速度；
-- profiler 核对是否真减少 kernel/IO。
+可靠 GPU timing 的最小协议：
 
-编译器可能已融合 naive PyTorch，因此“自写 Triton 必快”不是结论。边界 tile、stride 非连续、BF16 容差与 backward 才是自定义 kernel 最常坏的地方。
+~~~python
+def benchmark(run, warmups=5, trials=30):
+    for _ in range(warmups):
+        run()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(trials):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        run()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    return median(times)
+~~~
+
+CUDA launch 对 CPU 异步，不 synchronize 会只测 launch；warmup 排除 JIT、cache、allocator 首次成本；多次试验揭示噪声。讲义源码返回 mean，正式报告更适合 median 和 p20/p80。输入创建必须放到计时外；固定 dtype、device、shape、stride 和数据分布；对多 shape 扫描，因为小矩阵常被 launch overhead 主导，大矩阵才呈近立方 scaling。
+
+profile 则列出实际 CUDA kernel、调用次数与 CUDA time。PyTorch profiler 适合第一层查看，A2 再用 Nsight 看时间线、memory traffic、occupancy。示例 kernel 名：
+
+~~~text
+cutlass3x_sm100_simt_sgemm_f32_..._64x64x16_...
+~~~
+
+透露它来自 CUTLASS，目标是 Blackwell sm100，数据为 f32，tile 约 64×64×16。不同矩阵 shape 会选不同 kernel，所以不能把一次 profile 的结论泛化到所有输入。
+
+### 2. 先让 compiler 做一次：GeLU 三种实现
+
+讲义比较：
+
+1. PyTorch 逐表达式实现 tanh-approx GeLU；
+2. <code>torch.nn.functional.gelu(..., approximate='tanh')</code>；
+3. <code>torch.compile(naive_gelu)</code>。
+
+三者先用随机输入 <code>allclose</code> 对齐，再 benchmark/profile。naive eager 发多个 pointwise kernels、反复读写 HBM；builtin 与 compiled 常只有一个 fused kernel。compiled 版本本身就是 Triton kernel。这一步的重要结论是：**自写 Triton 的竞争对手应是 builtin/compiled，而不是故意慢的 eager 图。**
+
+### 3. Triton 思维：一个 program 处理一块数据
+
+CUDA 通常描述每个 thread 做什么；Triton 描述一个 program instance（近似一个 thread block）对一块 tensor 做什么，编译器映射 lanes、warps、shared/register。grid 决定 program instances 数，<code>tl.program_id(axis)</code> 取得当前块编号。
+
+GeLU kernel 的地址构造是：
+
+~~~python
+pid = tl.program_id(0)
+offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+mask = offsets < num_elements
+x = tl.load(x_ptr + offsets, mask=mask)
+# fused tanh approximation
+tl.store(y_ptr + offsets, y, mask=mask)
+~~~
+
+host wrapper 要验证 CUDA/contiguous、分配输出、用 <code>cdiv(numel,BLOCK_SIZE)</code> 建 grid，再 launch。最后一块越界 lane 必须在 load/store 都 mask。PTX 中 <code>ld.global/st.global</code> 是全局读写，<code>%ctaid.x</code> 是 block index，<code>%tid.x</code> 是 thread index；编译器还可能 thread coarsening，让一个物理 thread 处理 8 元素。
+
+### 4. 单行 softmax：mask 的 identity 决定正确性
+
+朴素 stable softmax 对 M×N 会依次 max、减 max、exp、sum、divide，约 5MN+M reads 与 3MN+2M writes；理想 fused 只读 MN、写 MN。若一行能放进一个 Triton program：
+
+~~~python
+BLOCK = triton.next_power_of_2(N)
+cols = tl.arange(0, BLOCK)
+row = tl.load(row_ptr + cols, mask=cols < N, other=-float('inf'))
+row = row - tl.max(row, axis=0)
+numerator = tl.exp(row)
+out = numerator / tl.sum(numerator, axis=0)
+tl.store(out_ptr + cols, out, mask=cols < N)
+~~~
+
+padding 的 <code>other</code> 必须是 −∞：它不能抬高 max，exp 后又正好为 0。若误用 0，当真实 logits 全为负时 padding 会成为假最大值，分母也加入不存在的列。每 row 一个 program，stride 参数使 row 起点不必假定紧密；但讲义 wrapper 只传 row stride，工程版还需明确最后一维 stride 或要求 contiguous。
+
+### 5. 一行放不下：row sum 的 baby tiling
+
+当 N=4096、BLOCK=1024，一个 program 中每 lane 可跨四个 tiles 累积：
+
+~~~python
+acc = tl.zeros([BLOCK_SIZE], tl.float32)
+for start in range(0, N, BLOCK_SIZE):
+    cols = start + tl.arange(0, BLOCK_SIZE)
+    x = tl.load(row_ptr + cols, mask=cols < N, other=0.0)
+    acc += x
+result = tl.sum(acc, axis=0)
+~~~
+
+sum 的 padding identity 是 0，而不是 −∞。acc 用 fp32，尤其 bf16 长 reduction 时可减少舍入误差。这里“每 thread 迭代 tiles”是概念解释；Triton 编译器会决定具体 lane/vector mapping 和 reduction 实现（shared memory 或 warp shuffle）。
+
+### 6. Matmul+ReLU：二维 pointer tensor 与 K-loop
+
+A 为 M×K、B 为 K×N。grid 的每个 program 负责 C 的 <code>BLOCK_M×BLOCK_N</code> tile；建立：
+
+$$
+A\_ptr[i,k]=base_A+i\cdot stride_{am}+k\cdot stride_{ak},
+$$
+
+$$
+B\_ptr[k,j]=base_B+k\cdot stride_{bk}+j\cdot stride_{bn}.
+$$
+
+沿 K 每次加载 <code>BLOCK_M×BLOCK_K</code> 与 <code>BLOCK_K×BLOCK_N</code>，<code>acc += tl.dot(a,b)</code>，指针前进 <code>BLOCK_K×stride</code>。acc 为 fp32；K-loop 后直接 <code>max(acc,0)</code> 融合 ReLU，只对 M/N 有效边界 store。
+
+<ExecutionTrace
+  title="Triton matmul program 的一次生命周期"
+  steps={[
+    { label: '定位', title: 'program_id 选择一个 C tile', input: '(pid_m, pid_n)', output: 'rows M_tile, cols N_tile', explanation: 'grid 两维分别 ceil(M/BM)、ceil(N/BN)。' },
+    { label: '建址', title: '用 stride 广播构造 A/B pointer grids', input: 'rows[:,None], k[None,:]', output: 'A_ptrs[BM,BK], B_ptrs[BK,BN]', explanation: 'stride 让二维逻辑索引映射到线性存储；不要把 shape 当 stride。' },
+    { label: 'K 循环', title: '加载、mask、tl.dot', input: 'K/BK 个 tile pairs', output: 'fp32 acc[BM,BN]', explanation: '越界 A/B 填 0；每轮前进指针，acc 始终留在片上。' },
+    { label: '融合', title: '在 acc 上做 ReLU', input: 'acc', output: 'max(acc,0)', explanation: '不先写 C 再启动第二个 activation kernel。' },
+    { label: '写回', title: '仅有效 M/N 元素落 HBM', input: 'C pointer grid', output: 'C tile', explanation: '最后边界 tile 的 mask 防止越界；输出 dtype 可按接口 cast。' },
+  ]}
+/>
+
+讲义版本固定 64×64×32 且只接受 contiguous float tensors，是教学正确基线，不是生产 GEMM：没有 autotune、grouped ordering、transposed layout、Tensor Core dtype 配置、split-K，也没有 backward。正确 benchmark 要扫非整除尺寸、非 contiguous stride、fp16/bf16/fp32 和多种 M/N/K；正确性容差必须随 dtype 与 reduction 长度调整。
+
+<CheckpointQuiz
+  question="Triton softmax 把一行 padding 到下一个 2 的幂时，越界 lane 的 load 应填什么？"
+  options={['0，因为 padding 通常都是 0', '−∞，使它既不影响 max，exp 后也不影响 sum', 'NaN，方便发现越界', '该行均值']}
+  answer={1}
+  explanation="reduction 的 identity 取决于运算：max 用 −∞，sum 用 0。softmax 同时做 max 与 exp-sum，所以 −∞ 满足两步。"
+/>
+
+### Lecture 6 源码讲义中文全文（按执行顺序）
+
+**入口与目标。** 上讲高层介绍 GPU 与性能；本讲做 benchmark/profile 并编写 kernels。顺序是复习 GPU，学习 benchmark/profile 找瓶颈，用 GeLU 比较 naive/builtin/compiled，再写 Triton GeLU、softmax、长行 sum、matmul+ReLU。总结要求：理解 PyTorch/Triton/PTX 编程模型以保证正确，理解 SM/warp/occupancy/bank conflict 优化性能；benchmark 看 scaling，profile 看实际执行与耗时；Triton 以 block 为单位把数据读入 shared、fusion 计算、写回 HBM。下讲进入多 GPU。
+
+**硬件表。** A100/H100/B200 的 SM 数分别 108/132/148；每 SM register 都约 256KB；L1+shared 分别 192/256/256KB；L2 为 40/50/96–126MB；HBM 为 80/80/192GB。估算带宽：register 约 116/401/447TB/s，L1/shared 约 19/33/19TB/s，L2 约 5–8/12/9TB/s，HBM 约 2/3.35/8TB/s。B200 还有程序员不可见、供 Tensor Core 使用、位于 register 与 shared 间的 TMEM。
+
+**编程模型。** thread 在一小块数据上执行代码；thread block/CTA 是线程组；grid 是 blocks 集合。H100/B200 还有支持 distributed shared memory 的 thread-block cluster。elementwise GeLU 自然一 thread 一元素；softmax/matmul 需要 threads 通信，HBM 慢所以用 SM 本地 shared memory。同 block threads 共享它，因此一个 block 调度在一个 SM。Triton 原生按 block 思考。编程模型抽象硬件，原则上足够保证正确；性能却对硬件极敏感。
+
+warp 是 block 内 32 threads；64-thread block 有两个 warps。同 warp lockstep，if/else 不同路径需串行，即 control divergence。SM 可同时运行多个 warps，当一个等待 HBM 时零成本切换。每 thread 可用 0–255 registers；register 越多，一个 SM 可驻留 threads 越少、occupancy 越低，但若每 thread 做更多工作，低 occupancy 未必坏。讲义计算 128 threads/block、160 registers/thread、SM 65536 registers 与最多 64 warps 下的 blocks、warps 和 occupancy，展示 register pressure 限制。
+
+shared memory 分 32 个 4-byte banks；每周期每 bank 只能服务一个不同地址。多个 threads 打到同 bank 会串行。若矩阵每 row 跨全 banks，32 threads 读第一列可造成 32-way bank conflict；matmul 同时读 A rows/B columns 时难完全避免，可用 swizzle（如 row xor col）重排。HBM 访问把 warp 请求合为 128-byte cache-line transactions；最佳情况 32×4 bytes 正好同一 line。blocks 以 waves 调度；B200 148 SM 运行 160 blocks 时第二波仅 12 blocks，wave quantization 造成低 block occupancy，理想上让 blocks 数与 SM 数配合。总结层次为 grid/HBM → block/shared → thread/register，warp、bank conflict、coalescing、occupancy 决定性能。
+
+**Benchmark/profile。** 成功循环是测量与 profile → 修改 → 再测量与 profile。benchmark 测 wall-clock 端到端，不说明时间位置，却能比较实现和 dimension scaling。讲义自写 benchmark：预热，CUDA synchronize，用 start/end events 记录，多 trial 捕捉方差，返回平均 ms。对 256…8192 方阵 matmul 扫描，小维度时间近常数，随后呈立方增长。profile 查看耗时位置并理解底层；PyTorch profiler 可看第一层，作业用 Nsight 更细。对 2048 add、2048 matmul、128 matmul profile，可看到调用 kernel 长名且 shape 不同选择不同 kernel；CUTLASS/sm100/f32/64×64×16 等名字分别暴露库、架构、dtype、tile。profile 函数 warmup/synchronize，在 CUDA activity 下运行，按 cuda_time_total 输出前十，并追加到 profiles.txt。
+
+**GeLU 对比。** 从 scratch 的 PyTorch tanh approximation、内置 fused GeLU、torch.compile 后的 naive 版本必须语义相同。对 16384 方阵 benchmark，builtin/compiled 明显更快。profile 显示 naive 是多个 kernels 与多次 HBM 读写；builtin/compiled 是一个 fused kernel、一读一写；compiled kernel 由 Triton 生成。
+
+**Triton GeLU。** CUDA 指定每 thread 工作，控制细但要自己管理 shared；OpenAI Triton 指定每 block 工作，入门时通常足够，框架是载入片上、操作/fusion、写回 global。host 断言 CUDA 与 contiguous，分配输出，BLOCK=1024，用 cdiv 算 blocks 并 launch。kernel 用 program_id、start、arange 得 offsets，mask 尾部，load，按 <code>0.5x(1+tanh(√(2/π)(x+0.044715x³)))</code> 近似计算；因无 tl.tanh，用 exp 恒等式，再 masked store。Triton 编译到 PTX；PTX 中 global load/store、block/thread index、浮点/整数 registers 可见，生成代码让一 thread 同时处理 8 元素。
+
+**Triton softmax。** softmax 用于 attention 与概率生成，对每 row exponentiate/normalize；[0,0,0] 变 [1/3,1/3,1/3]，[1,1,−∞] 变 [1/2,1/2,0]。naive stable 实现依次 row max、减 max、exp、sum、divide，总计约 5MN+M reads、3MN+2M writes；理想只 MN read/write，约四倍 IO 差。Triton 每 row 一个 block，BLOCK 为 N 的下一 2 次幂；按 row stride 构造指针，越界填 −∞，减 max、exp、sum、divide，再 masked store。与 PyTorch softmax 随机大矩阵 allclose 验证。
+
+**长行 row sum。** 若整 row 放不进 block，例如 4096 cols 对 1024 block，就切四 tiles；每 lane 跨 tiles 累积，最后对 lanes reduction，可用 shared 或 warp shuffle。示例两行 [1…4] 与 [5…8] 对齐 builtin。kernel 每 row 一个 program，fp32 acc 长度 BLOCK；for start 从 0 到 N，越界 fill 0，acc += x，最后 tl.sum 并写一个 scalar。
+
+**Matmul+ReLU。** matmul 是深度学习核心。naive 固定每个 (m,n)，沿 k 从 HBM 读 A[m,k]/B[k,n] 并累加，最后写 C；有 MKN reads、MN writes，强度 O(1)。相邻输出 C4/C5 会重复需要同一 A row，所以可用 shared 复用。若整个 A/B 都能入 shared，读量降为 MK+KN、写 MN、强度 O(N)，但通常太大。tiling 把 C 分 output tiles；每个 program 沿 K 载入匹配 A/B tiles、算局部乘并累积，再写 C，强度 O(tile size)。若随后做 GeLU/ReLU，应 fusion。
+
+二维 tensor 在线性 memory 的 index 为 row×stride_row+col×stride_col。host 固定 BM=64、BN=64、BK=32，grid 为 ceil(M/BM)×ceil(N/BN)。kernel 取二维 program IDs，建立 M/N/K indices 和广播 pointer grids，fp32 acc；沿 K masked load、tl.dot、推进指针；K 完成后对 acc 做 ReLU，按 M/N mask 写 output。辅助函数在计时外创建随机矩阵并返回闭包；naive/builtin functions 和三类随机 allclose checker 提供 oracle；mean 计算平均；output_ptx 把 kernel assembly 写到 var。
+
+最终总结：编程模型给正确性，硬件细节给性能；始终 benchmark 观察 scaling、profile 核对真实执行；Triton 用 block 组织 load/fuse/store；四例依次覆盖 elementwise、block 内 reduction、跨 tile reduction 与 tiled GEMM。
 
 ## Lecture 7：Collective 是分布式算法的积木
 
-设每个进程有 rank，总数 world size。broadcast 一份到所有；scatter 把分片发出；gather 收到一个 root；all-gather 让每个 rank 获得全部分片；reduce 汇总到 root；all-reduce 汇总后人人获得；reduce-scatter 汇总再分片；all-to-all 每 rank 向每个 rank 交换不同分片。
+单 GPU 里，计算与数据隔着 register/shared/HBM；多 GPU 里，隔着 NVLink、PCIe、InfiniBand 或 Ethernet。统一目标仍是组织计算，让慢层级的数据传输不成为瓶颈。并行解决两件事：模型状态/激活装不下，以及希望聚合更多 FLOPs 缩短训练时间。
 
-Ring all-reduce 可分成 reduce-scatter + all-gather，让每一步只传一个 chunk；通信量与 latency 取决于消息大小、链路拓扑和步数。单机 NVLink/NVSwitch 与跨机 InfiniBand/RDMA 带宽/延迟相差明显，TP 这类高频层内通信通常放高速域，PP/FSDP 可跨较慢域但需更大粒度。
+<TermDeck
+  title="分布式通信词典"
+  items={[
+    { term: 'Rank', expansion: 'Process Rank', chinese: '进程编号', explanation: '一个 process group 内设备/进程的唯一整数 ID，通常一进程绑定一 GPU；rank 0 常协调初始化但不是天然“主计算卡”。' },
+    { term: 'NCCL', expansion: 'NVIDIA Collective Communications Library', chinese: 'NVIDIA 集合通信库', explanation: '按实际 NVLink/PCIe/NIC 拓扑把 collective 编排成 GPU kernels 与传输协议。' },
+    { term: 'RDMA', expansion: 'Remote Direct Memory Access', chinese: '远程直接内存访问', explanation: '远端设备直接读写内存，绕过 CPU kernel socket/TCP copy 路径；InfiniBand 原生支持，RoCE 在 Ethernet 上提供类似能力。' },
+    { term: 'HCA', expansion: 'Host Channel Adapter', chinese: 'InfiniBand 主机通道适配器', explanation: '把 PCIe/GPU 侧接入 InfiniBand 网络的适配器，功能上类似支持 RDMA 的高性能 NIC。' },
+    { term: 'DDP', expansion: 'Distributed Data Parallel', chinese: '分布式数据并行', explanation: '每 rank 复制完整模型、处理不同 batch shard，并对梯度 all-reduce，使参数更新保持一致。' },
+    { term: 'PP', expansion: 'Pipeline Parallelism', chinese: '流水线并行', explanation: '按 depth 把连续 layers 分给 stages，以 microbatches 填充流水；通信频率较低但会产生 bubble。' },
+  ]}
+/>
 
-### 三种并行
+### 1. 八种 collective 的输入—输出语义
 
-- **Data parallel**：模型复制，batch 分片，梯度 all-reduce。每卡计算降、状态不降。
-- **Tensor parallel**：矩阵按行/列切。column-parallel 线性让输出 feature 分片，row-parallel 汇总局部输出。每层通信，要求快互联。
-- **Pipeline parallel**：层按 stage 切，microbatch 流水。显存易扩展，存在 pipeline bubble；1F1B 等 schedule 减少同时活跃 activation。
+设 world size 为 p：
+
+| Collective | 输入在哪里 | 输出在哪里 | 典型用途 |
+| --- | --- | --- | --- |
+| broadcast | root 一份 | 每 rank 完整一份 | 分发 checkpoint/config |
+| scatter | root 有 p shards | 每 rank 一个 shard | 分发数据 |
+| gather | 每 rank 一个 shard | root 完整拼接 | root 收集结果 |
+| reduce | 每 rank 同 shape | root 得 sum/min/max | root 汇总 |
+| all-gather | 每 rank 一个 shard | 每 rank 完整拼接 | FSDP 物化参数 |
+| reduce-scatter | 每 rank 有完整分块输入 | 先逐元素 reduce，再每 rank 留一 shard | 分片梯度 |
+| all-reduce | 每 rank 同 shape | 每 rank 都得 reduce 结果 | DDP 同步梯度 |
+| all-to-all | 每 rank 含发给所有 rank 的 shards | 每 rank 收到所有来源给自己的 shard | MoE token dispatch |
+
+“reduce”表示应用 associative/commutative 运算；scatter 与 gather 互逆；“all”表示输出目的地是所有 ranks。代数上：
+
+$$
+\operatorname{allreduce}
+=\operatorname{reduce\mbox{-}scatter}
++\operatorname{allgather}.
+$$
+
+这里的加号表示算法串接而非张量加法。拆开后，ZeRO/FSDP 可以只保留 reduce-scatter 后属于自己的 shard，不必 all-gather 完整梯度。
+
+<ExecutionTrace
+  title="4-rank ring all-reduce 的两阶段"
+  steps={[
+    { label: '切块', title: '每 rank 把 tensor 分成 4 chunks', input: 'gradient Gᵣ', output: 'Gᵣ[0…3]', explanation: '环上每轮发送一个 chunk 给邻居，同时接收另一 chunk。' },
+    { label: '归约散布', title: 'p−1 轮边传边加', input: '4 ranks × 4 chunks', output: '每 rank 持一个 fully reduced chunk', explanation: '没有任何 rank 在此阶段持有完整 reduced tensor。' },
+    { label: '全收集', title: '再用 p−1 轮传播 reduced chunks', input: '每 rank 一个 chunk', output: '每 rank 4 个 chunks', explanation: '此阶段只复制，不再做加法。' },
+    { label: '完成', title: '拼接为相同梯度', input: 'reduced chunks', output: 'ΣᵣGᵣ on every rank', explanation: 'DDP 若要平均梯度，再除 world size，或直接使用 ReduceOp.AVG。' },
+  ]}
+/>
+
+对大消息，ring 每 rank 每阶段发送约 <code>(p−1)/p × message_size</code>，all-reduce 两阶段约两倍；但 latency 还有 2(p−1) 个通信 steps。树算法对小消息可减少 steps。带宽报告有 algorithm bandwidth 与 bus bandwidth 两种 convention，必须注明；不要直接把 tensor bytes/time 与硬件单向链路峰值混比。
+
+### 2. 拓扑决定并行轴放在哪里
+
+典型速度层次由快到慢：单 GPU shared/L1 → HBM → 节点内 NVLink/NVSwitch → 跨节点 InfiniBand/RoCE → 普通 Ethernet。讲义以 B200 节点为例：8 GPUs 经 NVLink 5/NVSwitch，标称聚合约 1.8TB/s，而 HBM 约 8TB/s；256 nodes/pod 经 HCA 接 InfiniBand，量级约 0.05TB/s；pods 间再走 Ethernet。具体数字取决于单双向定义、代际与拓扑，方案设计应以实际 NCCL tests 为准。
+
+传统 Ethernet 路径涉及 GPU/host copy、kernel socket buffer、TCP packet 与 NIC ring；RDMA 让设备绕过 CPU 直接访问远端 memory。InfiniBand 支持 RDMA；RoCE 在融合以太网上实现 RDMA，成本更低但拥塞控制/可靠性工程更复杂。GB200/GB300 NVL72 把 72 GPUs 放进一个 NVLink domain，改变“节点内”边界。
+
+NCCL 会发现 GPU、switch、NVLink、PCIe、NIC 拓扑，选择 ring/tree/channels 与路径，并启动 GPU kernels 发送接收。PyTorch <code>torch.distributed</code> 提供统一 API：CPU 常用 Gloo，GPU 常用 NCCL。
+
+### 3. Data parallel：按 batch 切，梯度必须平均
+
+每 rank 拥有完整参数和 optimizer state，只加载 batch 的 1/p。local loss 不同，local gradients 也不同；对每参数梯度做 AVG all-reduce 后，每 rank 执行相同 optimizer step，参数继续相同。
+
+若全局目标是 batch mean：
+
+$$
+g=\frac{1}{\sum_r B_r}\sum_r\sum_{i\in r}g_i.
+$$
+
+只有各 local batch 等大时，“先 local mean，再对 ranks 等权平均”才等价。最后不等长 batch、padding mask 或动态 tokens 时，应按有效样本/token 数加权。讲义裸实现逐参数同步且阻塞；生产 DDP 把梯度放 buckets，在 autograd hook 中按 ready 顺序异步 all-reduce，与其余 backward 重叠。
+
+DP 增加吞吐但不减少每 rank 的模型状态。下一讲 FSDP/ZeRO 用 all-gather + reduce-scatter 同时获得 data parallel 与状态分片。
+
+### 4. Tensor parallel：按 width 切，通信进入每一层
+
+讲义采用简化 column split：W 的 output dimension 分到 p ranks，每 rank 算 <code>XW_r</code> 得 <code>[B,D/p]</code>，all-gather feature 后还原 <code>[B,D]</code> 给下一层。每层都通信完整 activation 量级，故通常限制在 NVLink 高速域。
+
+真实 Megatron MLP 常把两次线性配对：第一层 column-parallel，不立刻 gather，activation 与第二层输入仍分片；第二层 row-parallel，各 rank 算局部贡献后 all-reduce/reduce-scatter。这样一对线性只需少数 collectives。attention heads 也可按头分。TP 需要实现 backward 中相反的 collective，讲义把它留作练习。
+
+### 5. Pipeline parallel：按 depth 切，用 microbatch 填泡
+
+每 stage 持连续 layers，只向下一 stage 发送 activation、反向接收 activation gradient。若整 batch 一次通过，后级等待前级，设备大部分时间空闲；切成 m 个 microbatches 后，stage 0 一发出第一个就处理第二个，流水逐步填满。
+
+只做 forward 的理想 bubble fraction 近似：
+
+$$
+\frac{p-1}{m+p-1}.
+$$
+
+m 越大 bubble 越小，但每 microbatch GEMM 变小、launch overhead 增加，且训练 schedule 的 activation memory 变化。GPipe 先全 forward 后全 backward，activation 多；1F1B 填充后交替一次 forward/一次 backward，降低在途 activation。讲义裸实现只用 blocking send/recv 做 forward，没有 overlap 与 backward。
+
+<CheckpointQuiz
+  question="哪种并行通常最依赖节点内 NVLink 级高速互联？"
+  options={['Pipeline parallel，因为只在 stage 边界传 activation', 'Tensor parallel，因为几乎每层都有 collective', '纯 data loading', 'Checkpoint 保存']}
+  answer={1}
+  explanation="TP 的通信粒度高、频率高，难跨慢网络隐藏；PP 传输频率更低，虽有 bubble，但更能跨节点部署。"
+/>
+
+### Lecture 7 源码讲义中文全文（按执行顺序）
+
+**开场与路线。** 标题为 parallelism。上周研究单 GPU 内并行，本周研究多 GPU。两者共同点是 compute 离 inputs/outputs data 很远；主题是编排计算以避免传输瓶颈。层次从单卡 L1/shared、单卡 HBM、单节点 NVLink/NVSwitch，到多节点 InfiniBand/Ethernet，速度逐渐下降。上周用 fusion/tiling 减 memory access，本周用 replication/sharding 减 GPU/节点通信。多 GPU 原因一是参数连同 optimizer state、gradients、activations 装不下，二是使用更多 FLOPs 加速。可执行讲义多进程输出另存 stdout trace。
+
+第一部分讲 collective、硬件互联、NCCL/PyTorch 实现与实测带宽。第二部分在深 MLP 上从零实现 DP/TP/PP；MLP 是 Transformer compute bottleneck，具有代表性。未覆盖通信—计算 overlap、attention 等一般模型、sequence/expert/组合并行；JAX/TPU 可只定义模型与 sharding 让 compiler 处理，课程用 PyTorch 是为看见 primitives。
+
+最终总结：并行可沿 batch(data)、width(tensor/expert)、depth(pipeline)、length(sequence)；DP 包括 DDP all-reduce 与 FSDP/ZeRO all-gather+reduce-scatter；TP 要快互联，PP 可用慢互联但需减少 bubble；中间量可以重算、留本地 memory，或留别卡后通信。硬件会更快，模型也会更大，层次结构始终存在。
+
+**Collective 概念。** collective 是 1980 年代并行编程经典 primitive，描述多设备一般通信 pattern，通常优于手写 point-to-point。rank 是设备/进程编号，world size 是设备总数。基础是 broadcast/scatter/gather/reduce，主力是 all-gather/reduce-scatter/all-reduce，MoE 常用 all-to-all。
+
+Broadcast 把 rank 0 的 [0,1,2,3] 复制到四 ranks，可由 rank 0 加载 checkpoint 后分发。Scatter 把 rank 0 的四项分别给四 ranks，是理解 reduce-scatter 的台阶。Gather 反向把各 rank 的单项收回 rank 0，是 all-gather 的台阶。Reduce 对各 rank 单项做 sum/min/max 并只在 root 输出，例如 0+1+2+3=6，是 all-reduce 的台阶。
+
+All-gather 让每 rank 都得到拼接 [0,1,2,3]，可在每 rank 持 parameter shard 时为 forward 物化全参数。Reduce-scatter 对每个位置跨 ranks reduce，再把各位置分给不同 rank；示例四输入 [0,1,2,3]、[1,2,3,4]、[2,3,4,5]、[3,4,5,6]，输出分别 6、10、14、18，用于对 data shards 的 gradients 求和但分布存储。All-reduce 等于 reduce-scatter 加 all-gather，最终每 rank 都有 [6,10,14,18]，用于梯度求和且保留 full replicated parameters；拆分使 ZeRO/FSDP 更灵活。
+
+All-to-all 中，每 rank 向每个 destination 发不同项；示例输入行 0…3、4…7、8…11、12…15，输出按列变为 [0,4,8,12]、[1,5,9,13] 等。MoE 中每 rank 同时有 data shard 与 expert subset，需要按专家路由；平衡切分时像 transpose，也支持不平衡 split，但应尽量平衡。术语记忆：reduce 做可交换结合运算，scatter/gather 互逆，all 表示所有设备都是 destination。
+
+**硬件。** 家用经典设置中，同节点 GPUs 经 PCIe（讲义举 v7 16 lanes 242GB/s），跨节点普通 Ethernet 约 200MB/s。数据中心典型每节点 8 GPUs 经 NVLink/NVSwitch，B200 NVLink 5 约 1.8TB/s、HBM 约 8TB/s；每 pod 256 nodes，经 PCIe→HCA/NIC→InfiniBand cable，约 0.05TB/s；多个 pods 经 PCIe→CPU 的 Ethernet 连接。
+
+Ethernet 传统路径要 CPU 拷到 kernel socket buffer、构建 TCP packets、拷到 NIC ring；RDMA 允许一个 GPU 直接读写另一个 GPU memory 而不经过 CPU。InfiniBand 支持 RDMA，标准 Ethernet 不支持；RoCE 在 Ethernet 上绕 CPU，类似但更便宜/较弱，Meta 使用。GB200/GB300 NVL72 每 tray 8 GPUs、每 rack 9 trays，共 72 GPUs 同 NVLink domain。NCCL 把 collective 翻译成 GPU 间低层 packets，检测 nodes/switches/NVLink/PCIe 拓扑、优化路径并启动发送/接收 GPU kernels。
+
+**torch.distributed 示例。** PyTorch distributed 提供 all_gather_into_tensor 等整洁接口，Gloo 面向 CPU、NCCL 面向 GPU，也提供 FSDP 等高层算法但本课不直接依赖。课程 spawn 四进程；每个 rank setup process group。all-reduce 前数据为 [0,1,2,3]+rank，SUM 后都为 [6,10,14,18]。reduce-scatter 的 input 为 arange+rank、output 单元素；随后把该 output all-gather 回 world-size tensor，实证 all-reduce=reduce-scatter+all-gather。barrier 让日志和阶段对齐，操作原地修改 tensor。
+
+**通信 benchmark。** 对四 ranks、100×1024² elements 测 all-reduce 与 reduce-scatter。先 warmup，CUDA synchronize、barrier，再 wall clock 包住 collective，结束同步/屏障。all-reduce 代码按 ring 估 size×2×(p−1) send+receive 并除总 rank-time 得 effective bandwidth；注释指出约为 2×size/duration，和 world size/具体 ring/tree topology 的报告 convention 解耦。reduce-scatter input shape 为 p×num_elements，输出 num_elements；发送量无第二阶段的 2 倍。all-reduce 移动约两倍数据、耗时约两倍，因此测得 bandwidth 相似；讲义链接 nccl-tests 性能定义与示例脚本。
+
+**Data parallel 源码。** 每 rank 得 batch slice，实践应各自加载而非先复制整数据。128×1024 数据按四 ranks 等分。每 rank 用相同 seed 初始化四个 1024×1024 MLP 参数并拥有自己的 AdamW state。local forward 每层 matmul+GeLU，loss 为输出平方均值；backward 后逐参数 <code>dist.all_reduce(...AVG)</code>，再 optimizer.step。local losses 不同，gradients 同步相同，所以 parameters 始终相同。代码没有每步 zero_grad，是教学示例中应特别注意的缺口；正式循环必须清梯度。下一讲 FSDP/ZeRO 避免每卡持全参数。
+
+**Tensor parallel 源码。** 每 rank 获得全部 data，但每层只持 W 的 1/p output columns。每层局部 <code>x @ W_r</code> 与 GeLU 得 B×D/p，分配 p 个 activation buffers，all-gather 后沿 feature concat 恢复 B×D，再进下一层。最终各 rank forward output 相同；backward 留作练习。它展示按 width 切参数、传全部 activation。
+
+**Pipeline parallel 源码。** 两 ranks、四 layers，每 rank 两层，batch 切四 microbatches。rank 0 从 data.chunk 得 microbatches，其他 ranks 分配 activation buffers；每项若有前级就 blocking recv，计算 local layers，若有后级就 send。源码明确未处理 communication/computation overlap 与 bubble，backward 也留作练习。它展示按 depth 切层、传 activation。
+
+**运行辅助。** setup 设置 localhost master 地址/端口，GPU 用 NCCL、CPU 用 Gloo；cleanup 销毁 process group。DisableDistributed 在 edtrace 无法追踪 multiprocessing 时临时把 dist functions 替换为 no-op，退出恢复。spawn 正常用 <code>mp.spawn</code> 启 p processes，trace 模式只执行 rank 0。参数 helper 固定 seed、按输出维 √d 缩放并放对应 GPU；int_divide 对余数 assert；tensor summary 打印 shape 和首元素；duration 按 us/ms/s 格式化。
 
 ## Lecture 8：从教学积木到生产拓扑
 
-### ZeRO 三阶段
+单卡 scaling 同时撞上 compute 与 memory 上限；数据中心因此成为新的“计算单元”。理想多机系统希望 GPU 数增 p 倍时，可容纳参数与可用 FLOPs 也近似线性增 p 倍。现实中没有一种并行同时最省显存、最少通信、零 bubble、支持小 batch；大训练通常组合多轴。
 
-ZeRO-1 只分 optimizer state；ZeRO-2 再分 gradient；ZeRO-3/FSDP 连 parameter 也分。ZeRO-3 某层 forward/backward 前 all-gather 权重，gradient 完成后 reduce-scatter。模型状态约按 DP world size 缩小，但每步通信/临时 full layer buffer 增加。
+<TermDeck
+  title="并行轴一眼分清"
+  items={[
+    { term: 'ZeRO', expansion: 'Zero Redundancy Optimizer', chinese: '零冗余优化器', explanation: '逐阶段消除 data-parallel ranks 间重复的 optimizer state、gradients、parameters。' },
+    { term: 'FSDP', expansion: 'Fully Sharded Data Parallel', chinese: '完全分片数据并行', explanation: '工程上对应 ZeRO-3：参数按 rank 常驻分片，在每个 module 需要计算时 all-gather，梯度 reduce-scatter 后释放 full buffer。' },
+    { term: 'SP', expansion: 'Sequence Parallelism', chinese: '序列并行', explanation: '配合 TP，把 LayerNorm/dropout 等 pointwise activation 沿 sequence 分片，消除原本无法随 TP 缩小的 10sbh 项。' },
+    { term: 'CP', expansion: 'Context Parallelism', chinese: '上下文并行', explanation: '对长序列 attention 本身沿 context 分片，设备交换 K/V 或用 ring attention；同时缩小 KV/sequence activation。' },
+    { term: 'EP', expansion: 'Expert Parallelism', chinese: '专家并行', explanation: 'MoE experts 分布到 devices，通过 token all-to-all dispatch/combine；和 attention 的最优 TP/CP 轴可能不同。' },
+    { term: '1F1B', expansion: 'One Forward, One Backward', chinese: '一前向一反向调度', explanation: 'pipeline 填满后每 stage 交替处理 forward/backward microbatch，减少同时保存的 activations 并提高利用。' },
+  ]}
+/>
 
-FSDP 的关键优化包括：按 module 包装控制 gather 粒度；backward prefetch 与计算重叠；限制同时 materialize 的层避免显存峰值；mixed precision 通信/计算但 FP32 master update；state dict 在 full/sharded/local 格式间转换。
+### 1. ZeRO-1：分 optimizer state，通信几乎不变
 
-### 额外并行轴
+经典 mixed-precision Adam 可能每参数占 16 bytes：
 
-- **Sequence parallel**：在不需要全序列交互的 norm/dropout 等算子上切 sequence，降低 activation memory；
-- **Context parallel**：长 attention 在 sequence 轴分设备，交换 K/V 或使用 ring attention；
-- **Expert parallel**：MoE 专家分设备，token all-to-all；
-- **3D/4D parallel**：DP/FSDP × TP × PP，MoE 再加 EP；把频繁通信放高带宽拓扑，较低频通信跨节点。
+- bf16/fp16 parameter 2；
+- bf16/fp16 gradient 2；
+- fp32 master parameter 4；
+- fp32 first moment 4；
+- fp32 second moment 4。
 
-### 如何选择
+设 optimizer state 合计 K bytes/param。DDP 每 rank 保存全部，约 <code>(4+K)P</code>（这里 4 指低精度参数+梯度）。ZeRO-1 把 K 分到 d 个 DP ranks：
 
-先问单层能否放单卡、完整状态能否放、activation 能否放。模型放得下优先 DDP；状态放不下用 FSDP；单层放不下加 TP；层数/节点多再 PP；极长 T 用 context/sequence parallel；MoE 需要 EP。组合不是越多越好，每加一轴都增加 collective、调度和故障面。
+$$
+M_{Z1}\approx (4+K/d)P.
+$$
+
+步骤是：各 rank backward；reduce-scatter gradients；每 rank 只更新自己负责参数 shard 及 state；all-gather 更新后 parameters。通信仍约 P 的 reduce-scatter + P 的 all-gather，与一个 ring all-reduce 约 2P 相同。在 bandwidth-bound 大消息区间，ZeRO-1 的状态显存收益近似“免费”。
+
+### 2. ZeRO-2：梯度产生后立刻归约并释放
+
+ZeRO-2 再让 gradient 常驻分片。每个 rank 因 data parallel 仍会在 backward 计算每层完整 local gradient，但一旦该层 gradient ready，就立即 reduce-scatter 到 owner，非 owner 的 full gradient buffer 在不再参与 autograd 后释放。更新仍由 owner 完成，最后 all-gather parameters。
+
+关键区别是“从不在整个 step 同时物化 full gradient vector”，而不是“某一时刻绝不出现完整 layer gradient”。通信量仍约 2P，额外风险来自大量小层通信的 latency，因此需要 bucket、contiguous flatten 与 overlap。
+
+### 3. ZeRO-3 / FSDP：参数也按需物化
+
+ZeRO-3 常驻时每 rank 只有 parameter、gradient、optimizer 的 1/d。对一个 wrapped module：
+
+1. forward 前 all-gather parameter shards，得到临时 full parameters；
+2. 用它计算该 module；
+3. 若之后不立刻需要，reshard/free full buffer；
+4. backward 前可能再次 all-gather；
+5. 求完 full local gradient 后 reduce-scatter，只留 owned shard；
+6. owner optimizer update。
+
+因此每 step 粗略通信为两次 parameter all-gather + 一次 gradient reduce-scatter，约 3P，是 DDP/ZeRO-1/2 的 1.5 倍，且多一次 latency；但通信可与相邻 module compute prefetch overlap。FSDP 的真实效率取决于 wrap 粒度：太细会有小 collective latency，太粗会同时 materialize 巨大 full buffer。还需控制 forward/backward prefetch、同时在途 all-gather 数、mixed precision 与 full/sharded state dict。
+
+<ExecutionTrace
+  title="一个 FSDP block 的参数生命周期"
+  steps={[
+    { label: '常驻', title: '每 rank 仅持 W shard', input: 'Wᵣ, optimizerᵣ', output: '≈ 1/d model state', explanation: '这才是层与层之间的稳定显存状态。' },
+    { label: '预取', title: 'all-gather 当前/下一 block', input: '{Wᵣ}', output: 'temporary full W', explanation: '若网络与前一 block compute 重叠，墙钟通信可部分隐藏。' },
+    { label: '计算', title: 'full W 只服务该 block', input: 'activation, W', output: 'activation′', explanation: '峰值还包含 full module buffer；所以 wrap 粒度直接影响 OOM。' },
+    { label: '重分片', title: '释放非本 rank 参数', input: 'full W', output: 'Wᵣ', explanation: 'backward 若需要会再 gather；可用不同 reshard policy 换显存/通信。' },
+    { label: '归约', title: 'gradient reduce-scatter', input: 'local full dW', output: 'Σ dW shard on owner', explanation: '随后只更新 owned shard；无需在所有 ranks 保存 full gradient。' },
+  ]}
+/>
+
+题面用“几乎全部 bf16、保留 master weight”等假设取 12 bytes/param，在 8×A100 80GB 的理想静态上界中：baseline 约 6.66B 参数、ZeRO-1 16B、ZeRO-2 24.62B、ZeRO-3 53.33B。它们未计 activations、temporary gathers、fragmentation 与 CUDA context，绝不能直接当可运行 config。
+
+### 4. 为什么只有 data parallel 仍不够
+
+DP 受 global batch 限制：ranks 不能无限超过有效 batch/tokens，接近极限时每卡 GEMM 太小、communication 占比高，而且大 batch 有 diminishing returns。ZeRO-3 分了状态，却 **不自动缩 activation memory**。模型并行则把模型计算本身拆开：与 FSDP 传 parameters 不同，PP/TP 通常在 devices 间传 activations。
+
+### 5. Pipeline：低频 point-to-point，代价是 bubble
+
+按 depth 切层的朴素 layer-wise parallel 让 p GPUs 每张只活跃约 1/p 时间。microbatch pipeline 后，bubble/useful compute 比约为：
+
+$$
+\frac{p-1}{m},
+$$
+
+p 是 stages，m 是 microbatches。大 m 隐藏 bubble，却要求足够 global batch/gradient accumulation。PP 每边界每 microbatch 只传约 b×s×h activation，point-to-point，因而适合较慢跨节点链路；它减少 parameter memory，但 activation buffer 取决于 schedule。
+
+更复杂 interleaved/virtual stages 用更多通信改善利用。Zero-bubble pipeline 把 backward 分成 activation gradient（dX，必须尽快传前级）与 weight gradient（dW，可延后填空泡），但调度和 weight-version 管理更难。
+
+### 6. Tensor + sequence parallel：无 bubble，但每 block 通信
+
+矩阵可按 columns 与 rows 分解。Transformer 常见：
+
+- column-parallel：QKV 与 MLP up/gate projection；
+- row-parallel：attention output 与 MLP down projection；
+- replicated：norm、router 等小算子。
+
+配对 column/row 后，forward 某边界 identity、另一边界 all-reduce；backward 反过来。TP 无 pipeline bubble、不依赖大 batch，包装相对局部；代价是每 layer activation-sized collective。讲义估每层约 <code>8bsh(p−1)/p</code> all-reduce traffic，远高于 PP 的 stage-boundary bsh，因此 GPU 上通常 TP≤单节点 8 卡。
+
+activation 也必须核算。讲义沿用 Megatron 符号：a heads、b microbatch、s sequence、h hidden、t TP size。全保存时每层：
+
+$$
+M_{act}=sbh\left(34+5\frac{as}{h}\right).
+$$
+
+平方 attention/dropout 项 <code>5as/h</code> 可由 FlashAttention/选择重算去掉。仅 TP 后：
+
+$$
+M_{act}^{TP}=sbh\left(10+\frac{24}{t}+5\frac{as}{ht}\right).
+$$
+
+不随 t 缩小的 10 来自 LayerNorm 4sbh、dropout 2sbh、attention/MLP inputs 4sbh，它们都是 sequence 上 pointwise。SP 因而沿 sequence 切这些项，配合 all-gather/reduce-scatter；TP+SP+selective recomputation 可把每层压到：
+
+$$
+M_{act}^{TP+SP+recompute}=sbh\frac{34}{t},
+$$
+
+使 activation 也随设备近线性缩小。
+
+### 7. EP、CP 与 attention/MLP 解耦
+
+EP 不把一个 matmul 切碎，而把完整 experts 放不同设备，路由 token activations。它对 MoE MLP 类似 TP：高带宽、能减 expert weight memory；完整 expert GEMM 往往比切小 GEMM 更高效。但 EP 需要每 expert 足够 tokens，且 all-to-all 不平衡。
+
+MoE 只替换 MLP，attention 仍 dense。attention 喜欢较高 TP/CP，MLP 更愿用 EP 而低 TP；若强制两者同一 parallel group，会有利用率失衡。Megatron 因此把 attention 的 TP/CP/DP 与 MoE 的 expert-tensor/expert/expert-data parallel groups 解耦。
+
+CP/Ring Attention 沿长 sequence 分片 Q/K/V 与 KV cache，通过环传 K/V blocks 计算 exact attention；它解决极长 context 下即使 SP 也没分片 attention 本体的问题。通信随 activation/KV 而非 parameters。
+
+### 8. 组合并行的可操作选择树
+
+1. 先让单层可执行：节点内用 TP；MoE 用 EP；极长 context 加 CP。
+2. 让整模型状态/activation 可装：跨节点加 PP，或链路带宽允许时用 FSDP。
+3. 模型能装后，把剩余 GPUs 用 DP 扩吞吐。
+4. global batch 太小时，用 gradient accumulation 增大有效 batch/每次同步工作，但不要越过优化的 critical batch。
+5. 高频 collectives（TP/EP/CP）尽量放最快拓扑，PP/DP 跨慢域。
+
+常说“3D parallel”是 DP×TP×PP；MoE/long-context 再加入 EP/CP/SP 就是更高维。每加一轴都增加 process groups、collective ordering、checkpoint reshard、容错和调参面，不应为“完整”而全开。
+
+<CheckpointQuiz
+  question="FSDP 已把参数、梯度、optimizer state 全分片，为什么仍可能 OOM？"
+  options={['因为 FSDP 不支持 bf16', '因为 activations 与临时 full module all-gather buffer 仍可能很大', '因为 reduce-scatter 会复制全部 optimizer state', '因为 world size 必须为 1']}
+  answer={1}
+  explanation="ZeRO-3 解决常驻模型状态冗余，不自动消除 activation、attention 临时量和 gather 峰值；需要 checkpointing、SP/CP、合理 wrap/prefetch 联合处理。"
+/>
+
+### Lecture 8 PDF 中文全文（73 页，按页序）
+
+**第 1–3 页。** 标题 Parallelism Basics。目标是理解超大模型训练的 systems complexity、不同并行范式及为何同时使用，以及真实大规模训练长什么样。组织为 LLM networking 基础、并行训练形式、用并行扩展大模型。
+
+**第 4–8 页。** 单 GPU compute 有上限，而最快 supercomputer 有 exaflops；模型也大到单 GPU 装不下。解决方案是节点内高速互联与节点间高速网络，把 memory/compute 跨 GPUs/machines 切分。先回顾 reduce、all-reduce、all-gather、broadcast、reduce-scatter；all-reduce 可分 reduce-scatter+all-gather，在 bandwidth-limited 区间已是最优数据移动量。
+
+**第 9–12 页。** TPU 通信传统用 toroidal mesh，GPU 域常由 switch 支持一定规模 all-to-all。mesh 较便宜且可通过结构化 TP 做快，tree/A2A 更适合 expert parallel 等不规则通信。TPU8i/8t 也趋向 tree/switch 风格，可能服务 MoE；scale-out Virgo 使用 switched networks。不能把所有 accelerator 全互连，因为端口、布线、交换芯片和成本随 domain 爆炸，现实需要分域。
+
+**第 13 页。** 第一部分总结：datacenter 是新 compute unit；期望多机带来模型可容纳参数的线性 memory scaling 与 model FLOPs 的线性 compute scaling；collective 是基础。
+
+**第 14–17 页。** LLM 三类重要并行思想：data parallel（naive DP、ZeRO 1–3）、model parallel（pipeline、tensor）、activation parallel（sequence）。朴素 SGD 把 batch B 分到 M machines，交换 gradients 同步。每 GPU 计算 B/M examples；每 batch 通信约 2×参数，大 batch 时可接受；memory 不缩，每 GPU 至少持参数。问题是模型参数被复制。
+
+**第 18–20 页。** mixed precision 下内存很差，可能有五份权重相关数据、16 bytes/param：2-byte model params、2-byte gradients、4-byte fp32 master weights、4/2-byte Adam first moment、4/2-byte second moment。ZeRO 用 reduce-scatter 等价关系切昂贵 state。Stage 1 把一/二阶 optimizer state 分片，parameters+gradients 仍复制；每 worker 更新其负责参数 slice。
+
+**第 21–23 页。** ZeRO-1 步骤：每 rank 在 local batch 算 full gradient；reduce-scatter gradients，通信 P；owner 用 gradient+state 更新 shard；all-gather parameters，再通信 P。与 naive DDP 比：一个 gradient all-reduce 对一个 reduce-scatter+parameter all-gather，通信都约 2P；memory 从 (4+K)P 降为 (4+K/Ngpu)P。因此 bandwidth-bound 时 ZeRO-1 近似免费 memory win。ZeRO-2 再常驻分片 gradients；由于 DP，每 worker 仍计算 full local gradients，但不能让 full gradient vector 常驻。
+
+**第 24–27 页。** ZeRO-2 backward 增量执行：一层 gradient 算完立即 reduce 给 owner，不再需要时释放；owner update 后 all-gather parameters。ZeRO-3/FSDP 分片包括 parameters 在内的一切，沿 computation graph 按需请求/发送，仍用 incremental communication/computation。baby FSDP 每层通信粗略为两次 parameter all-gather 与一次 gradient reduce-scatter。实际 FSDP 参数/梯度请求后立刻释放，并在当前 compute 时预取下一参数，以 overlap 隐藏通信。
+
+**第 28–29 页。** DDP 通信约 2P；ZeRO-1 为 2P、近似免费；ZeRO-2 也是 2P、忽略 overhead 几乎免费；ZeRO-3 为 3P、通信 1.5 倍，忽略 latency 仍不坏。概念上只需 FSDP block wrapper。若几乎全部 BF16、用 Kahan summation且 optimizer states 较轻，题面假设 master weight 外共 12 bytes/param；8×A100 80GB 理想上 baseline 6.66B、ZeRO-1 16B（5 B/param）、ZeRO-2 24.62B（2 + 10/8）、ZeRO-3 53.33B（12/8）。
+
+**第 30–31 页。** DP compute scaling 受 machines < batch size 限制，接近时通信 overhead 高；batch size 增大还有 diminishing returns。ZeRO-1/2 不让 parameter memory 线性缩，ZeRO-3 虽好却不减 activation memory，需要更好的模型切分。
+
+**第 32–35 页。** Model parallel 在不改变 batch 时扩 memory：同 ZeRO-3 一样分 parameters，但它传 activations，ZeRO-3 传 parameters。三种切法是 pipeline、tensor+sequence、expert。layer-wise parallel 按 layers 分 GPU，来回传 activations/partial gradients；利用率很差，n GPUs 每张只活跃约 1/n，等待 backward。
+
+**第 36–40 页。** Pipeline 用 microbatches；发出第一个后立刻算第二个。bubble/useful compute 约 (nstages−1)/nmicro，因此需要大 batch。PP 看似差但省 memory，且通信只依赖 b×s×h activation、point-to-point，比 FSDP parameter traffic 友好，适合慢 inter-node 链路。性能高度依赖 batch；复杂 pipeline patterns 可用更多 bandwidth 换利用率。zero-bubble 把 backward 拆为传播 activation gradients 与计算 weight gradients，后者可任意填空。
+
+**第 41–44 页。** Pipeline 沿 depth，tensor parallel 沿 width。矩阵可拆 submatrices 并加 partial sums；把 A columns 与 B rows 分给 GPUs，forward 一侧 identity、另一侧 all-reduce，backward 反转。Transformer 中 QKV/up-projection columnwise，attention output/down-projection rowwise，norm/router replicated。GPU TP 通常限节点内至 8 卡高速互联。
+
+**第 45–46 页。** 相比 PP，TP 无 bubble，网络足够快就不等待，包装复杂度较局部，不需大 batch；缺点是通信大：PP 每 microbatch stage 边界 bsh point-to-point，TP 每 layer 约 8bsh(ndevices−1)/ndevices all-reduce。只有 low-latency/high-bandwidth interconnect 才优先 TP。memory 动态，activations 也可能巨大。
+
+**第 47–50 页。** 参数 memory 可由 TP/PP 线性减，但 activation 仍是瓶颈。存全部时每 layer activation 为 sbh(34+5as/h)，二次 attention/dropout 产生 5as/h，可像 FlashAttention 通过 recomputation 丢掉。TP 后为 sbh(10+24/t+5as/(ht))；TP 分了 attention/MLP matmuls，但 10 来自 LayerNorm 4sbh、dropout 2sbh 与 attention/MLP inputs 4sbh，仍随规模长。它们都是 sequence pointwise，因此 SP 沿 sequence 切；forward 中一方向 all-gather、另一方向 reduce-scatter，backward 反转。组合结果：无并行为原式；TP+SP 为 sbh(34/t+5as/(ht))；TP+selective recompute 为 sbh(10+24/t)；TP+SP+recompute 为 34sbh/t，实现 activation 线性 memory scaling。
+
+**第 51–55 页。** EP 不切 matmul，而切 experts 并 route activations。行为近似 MLP 上的 TP：高 bandwidth、减少 activation；但切 matmul 会降低效率，路由完整 activation 到专家有时更好。EP 可与其他策略组合，但 DP replicas 常与 EP splits 有约束（EP 小于 DP），DP 与 TP 组合也可能降低利用。MoE 只作用 MLP，attention 不能用 EP：attention 需要较高 TP，MLP 更喜欢低 TP+EP，产生不平衡。Megatron 用更灵活 groups，把 attention 的 TP/CP/DP 与 MLP 的 ETP/EP/EDP 分开。其他策略包括 context parallel/ring attention，把长 sequence activations 跨 GPUs。
+
+**第 56 页。** 总表：DDP/ZeRO-1 每 step gradient all-reduce，parameter 不缩（ZeRO-1 只缩 optimizer），activation 不缩，约 O(P) gradient traffic，global batch 随 DP 线性扩，易用；FSDP/ZeRO-3 约 1/DP state，activation 不缩，O(P) 但比 DDP 高的 parameter traffic，可 overlap，batch 随 DP 扩，中等难；PP 约 1/PP parameters，activation 取决于 buffers，stage 间 activation traffic，有 bubbles，不扩 global batch但需 microbatches，难；TP 每 block blocking activation collective，TP-sharded weights/相关 activation 约 1/TP，无 global batch scaling，难；SP/CP 不分 parameters，把 sequence activation/KV 降约 1/SP/CP，通信 activation/KV，难；EP 每 MoE all-to-all，expert weights 约 1/EP，需每 expert 足够 tokens，难。
+
+**第 57–61 页。** TPU book 比较 model vs tensor parallel，关键量是 global batch size/GPU。3D/4D 简单规则：模型装下前，机器内先 TP/EP，机器间 PP，或带宽允许用 ZeRO-3；装下后剩余 GPUs 用 DP。batch 小则 gradient accumulation，以更大 batch 换同步效率。Megatron 推荐从基础 DP/TP/PP/SP 到 MoE 的额外并行。Narayanan 2021 scaling 表中 TP 先增到 8 后封顶，PP 增到使模型装下，DP 随模型规模从 32 降到最大模型的 6。精心 3D parallel 可在更多 GPUs 上保持平坦利用率。
+
+**第 62–64 页。** TP=8 常最优；跨 64 machines 时 8×8 配置最佳。Activation recomputation 通过释放 memory 允许更大 batches，因而可能提高整体 throughput，例如 t=8、p=16 时有收益。
+
+**第 65–72 页。** 真实模型：Dolma 7B 用 FSDP，可能在节点内就装下。DeepSeek 用 ZeRO-1+TP/SP/PP；V3 为 PP16、EP64 跨 8 nodes、ZeRO-1，并用 1F1B all-to-all overlap。Yi 用 ZeRO-1+TP+PP；Yi-Lightning 2025 用 EP 替代 TP。Llama 3 405B 训练分 small-batch、pretraining、long-context stages，规模下 GPU failures 很多。Gemma 2 的 2/9/27B 用 ZeRO-3、MP(=TP+SP)、DP。Mixtral 8×22B 的 Megatron config 为 TP/PP/CP/EP=4/4/1/8，256 GPUs 下 DP 可能为 2。Nemotron 3 Super 120B-A12B 长上下文用 TP/PP/CP/EP=2/0/64/64。Qwen 3 的 235B-A22B 与 30B-A3B 主要 EP 到 8 GPUs，更大 config 为 TP/EP/PP=2/8/32。
+
+汇总表：DeepSeek TP1、EP8、PP16；DeepSeek V3 TP1、EP64、PP16；Yi 有 TP/PP、EP1；Llama 3 405B DP128、TP/SP8、PP16、CP1；Gemma 2 DP768、TP/SP8；Mixtral DP2、TP/SP4、EP8、PP4、CP1；Nemotron 3 长 context TP2、EP64、CP64；Qwen 3 Megatron TP2、EP32、PP8、CP1。共同模式是 TP 一般不超过 8，EP 可很大但困难，long-context phase 使用大 CP。
+
+**第 73 页。** 总结：超过某个规模必须多 GPU/多节点；没有单一并行方案，通常组合三类甚至更多；组合存在简单、可解释的经验规则。
 
 ## 与 Assignment 2 对接
 

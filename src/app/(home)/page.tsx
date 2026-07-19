@@ -1,72 +1,191 @@
 import Link from 'next/link';
-import { ArrowRight, BookOpen, Braces, Cpu, Database, GitBranch, Sparkles } from 'lucide-react';
+import {
+  ArrowRight,
+  BookOpen,
+  Braces,
+  Check,
+  CircleDot,
+  Cpu,
+  Database,
+  FlaskConical,
+  Gauge,
+  GitBranch,
+  Network,
+  Sparkles,
+} from 'lucide-react';
+import { CodeProofStrip, LearningRouteSelector, TokenJourneyConsole } from '@/components/home-interactions';
 
-const tracks = [
-  { icon: Braces, label: '01 · 基础', title: 'Tokenizer 与 Transformer', text: '亲手把文本变成 token，再把 token 变成下一个词的概率。', href: '/docs/foundations/tokenization' },
-  { icon: Cpu, label: '02 · 系统', title: 'GPU、Triton 与并行', text: '算清 FLOPs、显存和通信，让正确的模型真正跑得快。', href: '/docs/systems/gpu-kernels' },
-  { icon: GitBranch, label: '03 · 规模', title: 'Scaling Laws', text: '用小实验预测大训练，理解参数、数据、算力之间的权衡。', href: '/docs/scaling/laws' },
-  { icon: Database, label: '04 · 数据', title: '清洗、去重与评测', text: '从 Common Crawl 到可训练语料：质量决定模型能力的上限。', href: '/docs/data/pipeline' },
-  { icon: Sparkles, label: '05 · 对齐', title: 'SFT、DPO 与 GRPO', text: '让基础模型学会回答、推理，并在偏好与奖励下持续改进。', href: '/docs/alignment/post-training' },
+const stack = [
+  {
+    number: '01',
+    title: '文本变成 token',
+    text: '从 Unicode 与 UTF-8 开始，训练 byte-level BPE，并亲手实现可流式编码的 tokenizer。',
+    icon: Braces,
+    href: '/docs/foundations/tokenization',
+    tone: 'lime',
+  },
+  {
+    number: '02',
+    title: 'token 变成预测',
+    text: '逐层实现 RMSNorm、RoPE、attention 与 SwiGLU，追踪每个张量的形状和数值。',
+    icon: Network,
+    href: '/docs/foundations/transformer',
+    tone: 'violet',
+  },
+  {
+    number: '03',
+    title: '预测变成模型',
+    text: '把 loss、AdamW、学习率、数据批次与 checkpoint 接成一条可恢复的训练循环。',
+    icon: Gauge,
+    href: '/docs/foundations/training',
+    tone: 'orange',
+  },
+  {
+    number: '04',
+    title: '模型跑上集群',
+    text: '用 Triton、FlashAttention、DDP/FSDP 与推理系统把理论 FLOPs 变成真实吞吐。',
+    icon: Cpu,
+    href: '/docs/systems/gpu-kernels',
+    tone: 'blue',
+  },
+  {
+    number: '05',
+    title: '能力来自全栈',
+    text: '用 scaling laws 决定预算，以数据工程塑造分布，再通过 SFT 与 RL 完成后训练。',
+    icon: Sparkles,
+    href: '/docs/alignment/post-training',
+    tone: 'pink',
+  },
 ];
+
+const assignments = [
+  { id: 'A1', title: 'Basics', result: '一个从零训练的 Transformer LM', icon: Braces, href: '/docs/assignments/assignment-1' },
+  { id: 'A2', title: 'Systems', result: '更快的 kernel、attention 与分布式训练', icon: Cpu, href: '/docs/assignments/assignment-2' },
+  { id: 'A3', title: 'Scaling', result: '用小实验预测大模型最优配置', icon: GitBranch, href: '/docs/assignments/assignment-3' },
+  { id: 'A4', title: 'Data', result: '可审计的 Common Crawl 清洗管线', icon: Database, href: '/docs/assignments/assignment-4' },
+  { id: 'A5', title: 'Alignment', result: 'SFT、RFT 与 GRPO 推理训练闭环', icon: FlaskConical, href: '/docs/assignments/assignment-5' },
+];
+
+const sources = ['17 LECTURES', 'A1 · BASICS', 'A2 · SYSTEMS', 'A3 · SCALING', 'A4 · DATA', 'A5 · ALIGNMENT'];
 
 export default function HomePage() {
   return (
-    <main className="relative overflow-hidden">
-      <div className="hero-grid pointer-events-none absolute inset-x-0 top-0 h-[760px]" />
-      <section className="relative mx-auto flex min-h-[690px] w-full min-w-0 max-w-[100vw] flex-col items-center justify-center overflow-hidden px-6 pb-16 pt-28 text-center sm:max-w-7xl">
-        <div className="mb-7 inline-flex max-w-full items-center gap-2 whitespace-normal rounded-full border bg-fd-card/70 px-4 py-2 text-xs shadow-sm backdrop-blur sm:text-sm">
-          <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
-          Stanford CS336 · Spring 2026 中文学习版
-        </div>
-        <h1 className="w-full max-w-full text-balance text-4xl font-black leading-[1.08] tracking-[-0.045em] sm:max-w-5xl sm:text-7xl">
-          不只会调用模型，<br/><span className="gradient-text">从零造出语言模型。</span>
-        </h1>
-        <p className="mt-7 w-full max-w-2xl break-words text-pretty text-base leading-8 text-fd-muted-foreground sm:text-xl">
-          一条面向 LLM 初学者的完整路径：概念先修、算法推导、源码解剖、交互实验，以及五次课程作业的测试驱动带练。
-        </p>
-        <div className="mt-10 flex max-w-full flex-wrap justify-center gap-3">
-          <Link href="/docs/roadmap" className="inline-flex items-center gap-2 rounded-xl bg-fd-primary px-6 py-3 font-semibold text-fd-primary-foreground shadow-lg transition hover:-translate-y-0.5">
-            开始学习 <ArrowRight className="size-4" />
-          </Link>
-          <Link href="/docs/assignments" className="inline-flex items-center gap-2 rounded-xl border bg-fd-background/70 px-6 py-3 font-semibold backdrop-blur transition hover:bg-fd-accent">
-            <BookOpen className="size-4" /> 进入作业工坊
-          </Link>
-        </div>
-        <div className="glass-card mt-14 grid w-full min-w-0 max-w-4xl grid-cols-2 overflow-hidden rounded-2xl sm:grid-cols-4">
-          {[['17', '讲课程地图'], ['5', '次作业带练'], ['4', '类交互组件'], ['0→1', '完整训练链路']].map(([n, t]) => (
-            <div key={t} className="border-r border-fd-border/70 p-5 last:border-r-0">
-              <div className="text-2xl font-black">{n}</div><div className="mt-1 text-xs text-fd-muted-foreground">{t}</div>
+    <main className="journey-home">
+      <section className="journey-hero">
+        <div className="journey-glow journey-glow-one" />
+        <div className="journey-glow journey-glow-two" />
+        <div className="journey-shell journey-hero-grid">
+          <div className="journey-hero-copy">
+            <div className="journey-eyebrow"><Sparkles size={14} /> STANFORD CS336 · SPRING 2026 · INTERACTIVE EDITION</div>
+            <h1>
+              从一个字节开始，
+              <span>亲手训练语言模型。</span>
+            </h1>
+            <p className="journey-hero-lede">
+              不把 Transformer 当黑盒。沿着 tokenizer、架构、GPU 系统、缩放律、数据与对齐，读懂公式，也写出真正能通过测试、跑起实验的代码。
+            </p>
+            <div className="journey-hero-actions">
+              <Link className="journey-button journey-button-primary" href="/docs/roadmap">
+                开始学习 <ArrowRight size={17} />
+              </Link>
+              <Link className="journey-button journey-button-ghost" href="/docs/assignments">
+                <BookOpen size={17} /> 打开作业工坊
+              </Link>
             </div>
-          ))}
+            <CodeProofStrip />
+          </div>
+          <TokenJourneyConsole />
+        </div>
+        <div className="journey-source-ribbon" aria-label="课程材料覆盖">
+          <div className="journey-shell journey-ribbon-track">
+            <span className="journey-ribbon-label"><CircleDot size={14} /> COURSE MATERIALS</span>
+            {sources.map((source) => <span key={source}>{source}</span>)}
+          </div>
         </div>
       </section>
 
-      <section className="mx-auto max-w-7xl px-6 py-20">
-        <div className="mb-10 max-w-2xl">
-          <p className="mb-3 text-sm font-bold uppercase tracking-[.2em] text-violet-500">Build the whole stack</p>
-          <h2 className="text-3xl font-bold tracking-tight sm:text-4xl">沿着一条主线，把碎片知识连成系统</h2>
-          <p className="mt-4 leading-7 text-fd-muted-foreground">每一站都回答三个问题：它解决什么、为什么这样设计、如何在作业代码和测试中看见它。</p>
+      <section className="journey-section journey-stack-section">
+        <div className="journey-shell journey-split-heading">
+          <div>
+            <p className="journey-section-kicker">ONE END-TO-END STORY</p>
+            <h2>不是五门散课，<br />而是一条训练链路。</h2>
+          </div>
+          <p>
+            CS336 的每一部分都在回答同一个问题：怎样从原始网页得到一个会生成、能扩展、可对齐的语言模型。先把因果链连起来，再深入每个算法与实现。
+          </p>
         </div>
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-5">
-          {tracks.map(({ icon: Icon, ...item }) => (
-            <Link key={item.label} href={item.href} className="group rounded-2xl border bg-fd-card/60 p-5 transition hover:-translate-y-1 hover:border-violet-400/60 hover:shadow-xl">
-              <Icon className="mb-8 size-6 text-violet-500" />
-              <div className="text-xs font-bold text-fd-muted-foreground">{item.label}</div>
-              <h3 className="mt-2 font-bold">{item.title}</h3>
-              <p className="mt-3 text-sm leading-6 text-fd-muted-foreground">{item.text}</p>
+        <div className="journey-shell journey-stack-flow">
+          {stack.map(({ icon: Icon, ...item }, index) => (
+            <Link key={item.number} href={item.href} className="journey-stack-card" data-tone={item.tone}>
+              <div className="journey-stack-top"><span>{item.number}</span><Icon size={20} /></div>
+              <h3>{item.title}</h3>
+              <p>{item.text}</p>
+              <strong>进入这一层 <ArrowRight size={14} /></strong>
+              {index < stack.length - 1 && <i className="journey-stack-link" aria-hidden="true" />}
             </Link>
           ))}
         </div>
       </section>
 
-      <section className="mx-auto max-w-7xl px-6 pb-24">
-        <div className="overflow-hidden rounded-3xl border bg-[linear-gradient(120deg,rgba(109,93,252,.12),rgba(34,211,238,.08))] p-8 sm:p-12">
-          <div className="grid items-center gap-10 lg:grid-cols-[1fr_.8fr]">
-            <div><h2 className="text-3xl font-bold">读、算、写、测：四步闭环</h2><p className="mt-4 max-w-xl leading-7 text-fd-muted-foreground">先用直觉建立心智模型，再推一遍公式；接着只实现一个小接口，用官方测试得到反馈；最后回到系统视角解释性能与取舍。</p></div>
-            <div className="grid grid-cols-2 gap-3 text-sm">{['① 直觉与术语', '② 公式与形状', '③ 代码骨架', '④ 测试与复盘'].map((x) => <div key={x} className="rounded-xl border bg-fd-background/70 p-4 font-semibold">{x}</div>)}</div>
+      <section className="journey-section journey-route-section">
+        <div className="journey-shell journey-route-layout">
+          <div className="journey-route-intro">
+            <p className="journey-section-kicker">CHOOSE YOUR ENTRY POINT</p>
+            <h2>从你现在卡住的地方出发。</h2>
+            <p>不必按目录硬啃。先选当前目标，路线会告诉你先读什么、接着写什么、用什么测试确认理解。</p>
+          </div>
+          <LearningRouteSelector />
+        </div>
+      </section>
+
+      <section className="journey-section journey-assignment-section">
+        <div className="journey-shell">
+          <div className="journey-section-heading">
+            <div>
+              <p className="journey-section-kicker">BUILD, RUN, EXPLAIN</p>
+              <h2>五次作业，五件能运行的作品。</h2>
+            </div>
+            <p>每章从接口契约开始，给出完整实现与代码解读，再用官方测试、最小实验和排错路径闭环。</p>
+          </div>
+          <div className="journey-assignment-grid">
+            {assignments.map(({ icon: Icon, ...item }) => (
+              <Link key={item.id} href={item.href} className="journey-assignment-card">
+                <div><span>{item.id}</span><Icon size={19} /></div>
+                <small>{item.title}</small>
+                <h3>{item.result}</h3>
+                <strong>进入工坊 <ArrowRight size={14} /></strong>
+              </Link>
+            ))}
           </div>
         </div>
       </section>
+
+      <section className="journey-section journey-evidence-section">
+        <div className="journey-shell journey-evidence-card">
+          <div><span className="journey-evidence-stamp">READ<br />BUILD<br />VERIFY</span></div>
+          <div>
+            <p className="journey-section-kicker">THE LEARNING CONTRACT</p>
+            <h2>概念要能推导，代码要能运行，结论要能复现。</h2>
+            <p>每个陌生缩写先解释，每段关键代码说明输入、输出和不变量；论文结论、课程要求与工程经验分开标注，并回到源码和测试核对。</p>
+            <div className="journey-evidence-points">
+              <span><Check size={14} /> 术语首次出现即解释</span>
+              <span><Check size={14} /> 公式配张量形状</span>
+              <span><Check size={14} /> 实现配测试与排错</span>
+            </div>
+          </div>
+          <Link className="journey-button journey-button-light" href="/docs/resources/coverage">
+            查看课程地图 <ArrowRight size={17} />
+          </Link>
+        </div>
+      </section>
+
+      <footer className="journey-footer">
+        <div className="journey-shell">
+          <span>CS336 Learning Journey</span>
+          <p>Tokenize the text. Build the model. Scale the system.</p>
+          <Link href="/docs">打开完整文档 <ArrowRight size={14} /></Link>
+        </div>
+      </footer>
     </main>
   );
 }

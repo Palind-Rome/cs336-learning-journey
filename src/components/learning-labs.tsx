@@ -1,7 +1,7 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { Check, Circle, RotateCcw } from 'lucide-react';
+import { ArrowRight, Check, Circle, Info, RotateCcw } from 'lucide-react';
 
 export function TensorShapeLab() {
   const [batch, setBatch] = useState(2);
@@ -46,4 +46,144 @@ export function AssignmentStepper({ items }: { items: string[] }) {
   const [done, setDone] = useState<boolean[]>(()=>items.map(()=>false));
   const count = useMemo(()=>done.filter(Boolean).length,[done]);
   return <div className="not-prose my-6 rounded-2xl border bg-fd-card p-5"><div className="flex items-center justify-between"><b>动手进度</b><span className="text-sm text-fd-muted-foreground">{count}/{items.length}</span></div><div className="my-4 h-2 overflow-hidden rounded-full bg-fd-muted"><div className="h-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-all" style={{width:`${count/items.length*100}%`}}/></div><div className="grid gap-2">{items.map((item,i)=><button key={item} onClick={()=>setDone(v=>v.map((x,j)=>j===i?!x:x))} className="flex items-start gap-3 rounded-lg p-2 text-left text-sm hover:bg-fd-accent">{done[i]?<Check className="mt-0.5 size-4 text-emerald-500"/>:<Circle className="mt-0.5 size-4 text-fd-muted-foreground"/>}<span className={done[i]?'text-fd-muted-foreground line-through':''}>{item}</span></button>)}</div>{count>0&&<button onClick={()=>setDone(items.map(()=>false))} className="mt-3 flex items-center gap-1 text-xs text-fd-muted-foreground"><RotateCcw className="size-3"/>重置</button>}</div>;
+}
+
+type TermItem = {
+  term: string;
+  expansion?: string;
+  chinese: string;
+  explanation: string;
+  example?: string;
+};
+
+export function TermDeck({
+  items,
+  title = '第一次遇见这些词',
+}: {
+  items: TermItem[];
+  title?: string;
+}) {
+  const [active, setActive] = useState(0);
+  const item = items[active] ?? items[0];
+  if (!item) return null;
+
+  return <div className="term-deck not-prose">
+    <div className="term-deck-heading">
+      <div><span>TERM DECK</span><h3>{title}</h3></div>
+      <b>{String(active + 1).padStart(2, '0')} / {String(items.length).padStart(2, '0')}</b>
+    </div>
+    <div className="term-deck-body">
+      <div className="term-deck-tabs" role="tablist" aria-label={title}>
+        {items.map((candidate, index) => <button
+          key={`${candidate.term}-${index}`}
+          role="tab"
+          aria-selected={index === active}
+          onClick={() => setActive(index)}
+        >{candidate.term}</button>)}
+      </div>
+      <div className="term-deck-panel">
+        <span>{item.expansion ?? item.term}</span>
+        <h4>{item.term} · {item.chinese}</h4>
+        <p>{item.explanation}</p>
+        {item.example && <code>{item.example}</code>}
+      </div>
+    </div>
+    <p className="term-deck-footnote"><Info size={14} /> 点击缩写切换；后文再次出现时，先把它读成这里的完整含义。</p>
+  </div>;
+}
+
+type TraceStep = {
+  label: string;
+  title: string;
+  input: string;
+  output: string;
+  explanation: string;
+};
+
+export function ExecutionTrace({
+  title,
+  steps,
+}: {
+  title: string;
+  steps: TraceStep[];
+}) {
+  const [active, setActive] = useState(0);
+  const step = steps[active] ?? steps[0];
+  if (!step) return null;
+
+  return <div className="execution-trace not-prose">
+    <div className="execution-trace-heading"><span>EXECUTION TRACE</span><h3>{title}</h3></div>
+    <div className="execution-trace-track" role="tablist" aria-label={title}>
+      {steps.map((candidate, index) => <button
+        key={`${candidate.label}-${index}`}
+        role="tab"
+        aria-selected={index === active}
+        onClick={() => setActive(index)}
+      >
+        <b>{index + 1}</b><span>{candidate.label}</span>{index < steps.length - 1 && <ArrowRight size={13} />}
+      </button>)}
+    </div>
+    <div className="execution-trace-panel">
+      <span>STEP {String(active + 1).padStart(2, '0')}</span>
+      <h4>{step.title}</h4>
+      <div><code>IN&nbsp; {step.input}</code><code>OUT {step.output}</code></div>
+      <p>{step.explanation}</p>
+    </div>
+  </div>;
+}
+
+export function AdvantageNormalizerLab() {
+  const [groupSize, setGroupSize] = useState(8);
+  const [correct, setCorrect] = useState(2);
+  const [normalizer, setNormalizer] = useState<'std' | 'none' | 'mean'>('std');
+  const boundedCorrect = Math.min(correct, groupSize);
+  const mean = boundedCorrect / groupSize;
+  const sampleVariance = groupSize > 1
+    ? (boundedCorrect * (1 - mean) ** 2 + (groupSize - boundedCorrect) * mean ** 2) / (groupSize - 1)
+    : 0;
+  const denominator = normalizer === 'std'
+    ? Math.sqrt(sampleVariance) + 1e-6
+    : normalizer === 'mean'
+      ? mean + 1e-6
+      : 1;
+  const positive = boundedCorrect ? (1 - mean) / denominator : null;
+  const negative = boundedCorrect < groupSize ? -mean / denominator : null;
+
+  return <div className="not-prose my-6 rounded-2xl border bg-fd-card p-5">
+    <div className="font-bold">Group advantage 实验台</div>
+    <p className="mb-5 text-sm text-fd-muted-foreground">reward 为 0/1；std 使用与课程测试一致的样本标准差。拖动后观察难度重加权。</p>
+    <div className="grid gap-4 sm:grid-cols-2">
+      <label className="text-sm"><span className="flex justify-between"><b>group size G</b><code>{groupSize}</code></span><input className="learning-slider mt-2 w-full" type="range" min="2" max="16" value={groupSize} onChange={(event) => { const value = Number(event.target.value); setGroupSize(value); setCorrect((current) => Math.min(current, value)); }}/></label>
+      <label className="text-sm"><span className="flex justify-between"><b>correct rollouts</b><code>{boundedCorrect}</code></span><input className="learning-slider mt-2 w-full" type="range" min="0" max={groupSize} value={boundedCorrect} onChange={(event) => setCorrect(Number(event.target.value))}/></label>
+    </div>
+    <div className="mt-4 flex flex-wrap gap-2">{(['std', 'none', 'mean'] as const).map((item) => <button key={item} onClick={() => setNormalizer(item)} className={`rounded-full border px-3 py-1.5 text-sm ${normalizer === item ? 'border-violet-500 bg-violet-500/10 text-violet-600' : 'hover:bg-fd-accent'}`}>{item === 'std' ? 'GRPO · ÷ std' : item === 'mean' ? 'MaxRL · ÷ mean' : 'Dr.GRPO · 不除'}</button>)}</div>
+    <div className="mt-5 grid gap-3 sm:grid-cols-4">
+      <div className="rounded-xl bg-fd-muted p-3"><span className="text-xs text-fd-muted-foreground">group mean</span><div className="font-mono font-bold">{mean.toFixed(4)}</div></div>
+      <div className="rounded-xl bg-fd-muted p-3"><span className="text-xs text-fd-muted-foreground">sample std</span><div className="font-mono font-bold">{Math.sqrt(sampleVariance).toFixed(4)}</div></div>
+      <div className="rounded-xl bg-emerald-500/10 p-3"><span className="text-xs text-fd-muted-foreground">correct advantage</span><div className="font-mono font-bold text-emerald-600">{positive === null ? '—' : positive.toFixed(4)}</div></div>
+      <div className="rounded-xl bg-red-500/10 p-3"><span className="text-xs text-fd-muted-foreground">wrong advantage</span><div className="font-mono font-bold text-red-600">{negative === null ? '—' : negative.toFixed(4)}</div></div>
+    </div>
+    {(boundedCorrect === 0 || boundedCorrect === groupSize) && <p className="mt-3 text-sm text-amber-600">组内 reward 完全相同，减去 group mean 后所有 advantage 都为 0，这组不会提供梯度。</p>}
+  </div>;
+}
+
+export function ImportanceClipLab() {
+  const [logRatio, setLogRatio] = useState(0.25);
+  const [advantage, setAdvantage] = useState<1 | -1>(1);
+  const [epsilon, setEpsilon] = useState(0.2);
+  const ratio = Math.exp(logRatio);
+  const clippedRatio = Math.min(1 + epsilon, Math.max(1 - epsilon, ratio));
+  const unclipped = advantage * ratio;
+  const clipped = advantage * clippedRatio;
+  const surrogate = Math.min(unclipped, clipped);
+  const gradientActive = advantage > 0 ? ratio <= 1 + epsilon : ratio >= 1 - epsilon;
+
+  return <div className="not-prose my-6 rounded-2xl border bg-fd-card p-5">
+    <div className="font-bold">PPO / GRPO clipping 实验台</div>
+    <p className="mb-5 text-sm text-fd-muted-foreground">ratio = exp(log πθ − log πold)。目标取 min(A·ratio, A·clip(ratio))。</p>
+    <label className="block text-sm"><span className="flex justify-between"><b>log importance ratio</b><code>{logRatio.toFixed(2)}</code></span><input className="learning-slider mt-2 w-full" type="range" min="-1.2" max="1.2" step="0.05" value={logRatio} onChange={(event) => setLogRatio(Number(event.target.value))}/></label>
+    <label className="mt-4 block text-sm"><span className="flex justify-between"><b>clip ε</b><code>{epsilon.toFixed(2)}</code></span><input className="learning-slider mt-2 w-full" type="range" min="0.05" max="0.5" step="0.05" value={epsilon} onChange={(event) => setEpsilon(Number(event.target.value))}/></label>
+    <div className="mt-4 flex gap-2"><button onClick={() => setAdvantage(1)} className={`rounded-full border px-3 py-1.5 text-sm ${advantage > 0 ? 'border-emerald-500 bg-emerald-500/10' : ''}`}>A = +1</button><button onClick={() => setAdvantage(-1)} className={`rounded-full border px-3 py-1.5 text-sm ${advantage < 0 ? 'border-red-500 bg-red-500/10' : ''}`}>A = −1</button></div>
+    <div className="mt-5 grid gap-3 sm:grid-cols-4"><div className="rounded-xl bg-fd-muted p-3"><span className="text-xs text-fd-muted-foreground">ratio</span><div className="font-mono font-bold">{ratio.toFixed(4)}</div></div><div className="rounded-xl bg-fd-muted p-3"><span className="text-xs text-fd-muted-foreground">clipped ratio</span><div className="font-mono font-bold">{clippedRatio.toFixed(4)}</div></div><div className="rounded-xl bg-fd-muted p-3"><span className="text-xs text-fd-muted-foreground">surrogate</span><div className="font-mono font-bold">{surrogate.toFixed(4)}</div></div><div className={`rounded-xl p-3 ${gradientActive ? 'bg-emerald-500/10' : 'bg-amber-500/10'}`}><span className="text-xs text-fd-muted-foreground">该 token 梯度</span><div className="font-bold">{gradientActive ? '继续更新' : '被截断为 0'}</div></div></div>
+  </div>;
 }

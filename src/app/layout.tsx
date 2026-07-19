@@ -1,4 +1,5 @@
 import { Provider } from '@/components/provider';
+import 'katex/dist/katex.min.css';
 import './global.css';
 
 export default function Layout({ children }: LayoutProps<'/'>) {

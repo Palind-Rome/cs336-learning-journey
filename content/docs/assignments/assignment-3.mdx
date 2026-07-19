@@ -1,58 +1,412 @@
 ---
 title: Assignment 3 · Scaling
-description: 在真实 GPU 时间预算下设计实验、拟合 IsoFLOP 曲线并提交最终模型配置。
+description: 从 72 个合成 run 复现 IsoFLOPs，到在 12 B200-hours 内设计实验、拟合 loss surface 并选择 48 小时训练配置。
 ---
 
-## 任务的真正难点
+## 这一章解决的问题
 
-你不是被要求“拟合一条线”，而是用有限实验预算决定下一次昂贵训练。合成数据教统计流程；在线 API 把约束换成 B200 wall-clock，架构、batch、dtype 与 kernel 效率都会影响同样 `6ND` 对应的时间。
+有固定训练预算时，应该把算力用于“更大的模型”，还是“让较小模型看更多 token”？A3 不要求再造 Transformer，而是训练一种更容易被忽略的能力：**用少量小实验预测一次昂贵训练**。
 
-## 第一阶段：在合成数据上走通 IsoFLOP
+题面给定最终预算 48 B200-hours，探索预算只有额外 12 B200-hours。要提交：可复现的方法、预测的最佳 architecture/training hyperparameters、预测 validation loss，以及对最终配置的 API submission。
 
-`data/isoflops_curves.json` 含 72 个 run、9 个 compute budget、每档 8 个模型。对每个 C：画 N–loss 曲线，确认最低点两侧都有观测；取最低 loss 对应 `N*`，再由 `D*=C/(6N*)` 得 token 数。对 `(log C, log N*)` 和 `(log C, log D*)` 线性回归：
+这不是简单拟合一条直线。你还必须处理：模型 shape 对实际吞吐的影响、API 预留预算、失败/timeout、离散 architecture、learning rate 与 batch 的干扰、外推不确定性，以及“最低点落在搜索边界”时怎样补实验。
 
-```text
-N*(C)=A·C^a     D*(C)=B·C^b
-log N*=log A+a log C
-```
-
-<Callout type="info" title="复算，不是唯一标准答案">
-  按“每档直接取最小点 + log-OLS”，当前数据可复算得 a≈0.4687、b≈0.5313；外推值会随拟合方法、边界点和异常处理略变。报告必须写清方法与不确定性。
-</Callout>
-
-## 第二阶段：读懂训练 API 和 config
-
-先读 `cs336_scaling/client.py`：budget、submit、experiments、单 run 与 final submission。再逐行读 `training/training_config.py`，把 validator 当成搜索空间说明书：sequence 512、hidden size 与 heads/head_dim 的整除关系、RoPE 偶数 head_dim、FFN 不小于 hidden、token/batch/eval 的整除条件等。
-
-默认模型在 `training/run.py`，真正结构在 `training/model/basic_model.py`：JAX/Equinox、RMSNorm、RoPE、QK norm、SwiGLU 和 FSDP sharding。`training/loop.py` 说明训练与验证如何按 next-token CE 计量。
-
-## 第三阶段：用 12 B200-hours 买信息
-
-1. 极短 pilot：验证 API、吞吐、loss 会降、学习率不爆。
-2. 多预算宽扫 N：先包住谷底，不急着密集。
-3. 对最低点附近加密；边界最优必须扩区间。
-4. 用不同 `model_seed` 复现关键点；保留预算处理失败/timeout。
-5. 拟合后做 held-out budget 检验，再映射到最终 layers/width/heads/FFN/batch/lr/tokens。
-
-每个 run 提交前先回答：“它能区分哪两个决策？”排队和运行会按预留最大时长占预算，别用夸大的 runtime 把预算锁死。
-
-<AssignmentStepper items={[
-  '合成曲线按 budget 分组并画出最低点',
-  '在 log 空间拟合，报告残差与边界点',
-  '最小 API pilot 成功且记录实际吞吐',
-  '搜索范围覆盖每条曲线谷底两侧',
-  '留出关键点复现与异常预算',
-  '最终参数量用模型代码实际统计验证'
+<TermDeck title="Scaling law 词汇卡" items={[
+  { term: 'scaling law', chinese: '规模定律', explanation: '从一系列训练实验归纳出的经验关系，描述 loss 如何随参数量、数据量或计算量变化。它是观测模型，不是对任意尺度都必然成立的数学定理。' },
+  { term: 'compute-optimal', chinese: '计算最优', explanation: '在固定 compute budget 下，使最终 loss 最低的参数量 N 与训练 token 数 D 的组合。更大的 N 不一定更好，因为它可能没有预算训练充分。' },
+  { term: 'IsoFLOPs', expansion: 'equal-FLOPs profile', chinese: '等计算量剖面', explanation: '固定 C，改变 N，并用 D=C/(6N) 调整数据量。每条曲线的最低点给出该 C 下的 Nopt/Dopt。', example: 'same C, different N and D' },
+  { term: 'FLOPs', expansion: 'Floating-Point Operations', chinese: '浮点运算总量', explanation: '训练工作量近似 C=6ND。注意 FLOPs 是总工作量，FLOP/s 是执行速度，B200-hours 是墙钟资源。' },
+  { term: 'extrapolation', chinese: '外推', explanation: '用小规模范围内拟合的关系预测更大规模。离观测区越远，模型形式与少量噪声带来的偏差越会被放大。' },
+  { term: 'power law', chinese: '幂律', explanation: '形如 y=A·x^a 的关系。取对数后变成直线 log y=log A+a log x，因此可用线性回归拟合。' },
+  { term: 'irreducible loss', chinese: '不可约损失', explanation: '即使 N/D 无限增大，受数据分布熵与任务噪声影响仍无法降到零的 loss 下界，常写作 E。' },
+  { term: 'held-out', chinese: '留出验证', explanation: '不参与拟合的一组 compute budget 或 run，用来检查 scaling law 是否真的能预测，而不只是记住已有点。' },
+  { term: 'bootstrap', chinese: '自助重采样', explanation: '从已有 runs 有放回采样并重复拟合，观察 Nopt、Dopt、loss 的分布，用于表达外推不确定性。' },
+  { term: 'DCLM', expansion: 'DataComp for Language Models', chinese: '训练数据集', explanation: '本作业 API 使用的已 tokenized 语言模型数据，固定顺序、最多 500B tokens；不同配置会消费相同的确定性 token 顺序。' }
 ]} />
 
-## 常见失败
+## 0. 三个量先不要混
 
-- 直接在线性空间拟合，让大数值点支配；
-- 把 failed/timeout 的中途 loss 当 final；
-- 只用 `6ND` 估真实 runtime；
-- token/batch/eval 不满足 config 整除；
-- 同 config 重复提交触发 409，复现时没换 seed；
-- 最优点在搜索边缘仍强行拟合；
-- 用尽探索预算，没有独立检验。
+- $N$：通常指 non-embedding parameters；
+- $D$：训练处理的 token 总数；
+- $C$：训练 FLOPs，Transformer 粗略近似 $C=6ND$。
 
-证据入口：[A3 仓库](https://github.com/stanford-cs336/assignment3-scaling)、[`training_config.py`](https://github.com/stanford-cs336/assignment3-scaling/blob/main/cs336_scaling/training/training_config.py)、[`client.py`](https://github.com/stanford-cs336/assignment3-scaling/blob/main/cs336_scaling/client.py)。
+系数 6 的直觉是：每个 parameter 对每个 token，forward 大约贡献 2 次浮点操作，backward 计算 activation gradient 与 weight gradient 又约是 forward 的 2 倍，总计约 $2+4=6$。这是跨架构比较的粗略账本，不是墙钟时间预测器；不同 width/depth、batch、dtype、kernel 与硬件利用率即使 $6ND$ 相同，runtime 也可能不同。
+
+固定 C 时，模型过小会欠拟合，数据再多也受 capacity 限制；模型过大时 $D=C/(6N)$ 太少，gradient steps 不足，模型没有训练充分。因此 loss 对 log N 常呈 U 形，最低点就是该 compute budget 的 `Nopt`。
+
+## 1. 用合成数据完整复现 IsoFLOPs
+
+官方 `data/isoflops_curves.json` 有 72 个 run、9 档 compute，每档 8 个不同 N。对象字段是 `parameters`、`compute_budget`、`final_loss`。
+
+### 1.1 第一步：按 C 分组并直接取最低 loss
+
+题面说明 Chinchilla 原论文会对每条 profile 拟合二次曲线；本题推荐直接选择观测到的最低点。这样不需要假设每档 8 个点恰好落在对称抛物线上：
+
+```python
+def select_isoflops_minima(runs):
+    grouped = {}
+    for run in runs:
+        grouped.setdefault(float(run['compute_budget']), []).append(run)
+    return [
+        min(grouped[compute], key=lambda run: run['final_loss'])
+        for compute in sorted(grouped)
+    ]
+```
+
+当前文件得到：
+
+| C (FLOPs) | Nopt | 最低 loss | Dopt = C/(6Nopt) |
+|---:|---:|---:|---:|
+| 6e18 | 762,093,419 | 5.89993 | 1.312B |
+| 1e19 | 806,647,749 | 5.61794 | 2.066B |
+| 3e19 | 1,536,852,354 | 5.10718 | 3.253B |
+| 6e19 | 1,952,041,776 | 4.83059 | 5.123B |
+| 1e20 | 3,253,402,960 | 4.65289 | 5.123B |
+| 3e20 | 5,903,836,027 | 4.31122 | 8.469B |
+| 6e20 | 6,971,055,968 | 4.12124 | 14.345B |
+| 1e21 | 6,859,328,563 | 4.00283 | 24.298B |
+| 3e21 | 12,148,905,329 | 3.77319 | 41.156B |
+
+1e21 档的 Nopt 比 6e20 档略小不是代码错误：我们取的是有限网格中的观测最低点，training noise 和候选间距都会让序列不严格单调。幂律拟合会平滑这类偏差。
+
+### 1.2 第二步：在 log 空间拟合幂律
+
+设：
+
+$$N_{opt}(C)=A C^a,\qquad D_{opt}(C)=B C^b.$$
+
+取对数：
+
+$$\log N_{opt}=\log A+a\log C.$$
+
+使用 ordinary least squares：
+
+```python
+def fit_power_law(x, y):
+    design = np.column_stack([np.ones_like(x), np.log(x)])
+    log_coefficient, exponent = np.linalg.lstsq(
+        design, np.log(y), rcond=None
+    )[0]
+    return np.exp(log_coefficient), exponent
+```
+
+完整脚本见 [`fit_isoflops.py`](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment3/fit_isoflops.py)，会自动选 minima、拟合、生成两张 log–log 图并打印预测：
+
+```bash
+python examples/assignment3/fit_isoflops.py \
+  asset/assignment3-scaling/data/isoflops_curves.json \
+  --plot isoflops-fit.png
+```
+
+<img src={(process.env.NEXT_PUBLIC_BASE_PATH || '') + '/images/a3-isoflops.png'} alt="IsoFLOPs 模型参数量与训练 token 幂律拟合" />
+
+复算结果为：
+
+$$N_{opt}=1.16341\,C^{0.468683},\qquad
+D_{opt}=0.143257\,C^{0.531317}.$$
+
+log-space $R^2$ 分别约 0.9787 与 0.9834。两个指数之和为 1，这是因为每个选中的点都强制满足 $D=C/(6N)$；若 $N\propto C^a$，就必然有 $D\propto C^{1-a}$。
+
+题面 PDF 的数学排版是 $10^{23}$ 与 $10^{24}$ FLOPs，文本提取可能显示成 1023/1024。预测为：
+
+| 预算 | Nopt | Dopt |
+|---:|---:|---:|
+| $10^{23}$ FLOPs | 70.05B parameters | 237.91B tokens |
+| $10^{24}$ FLOPs | 206.12B parameters | 808.60B tokens |
+
+检查 $6N_{opt}D_{opt}$ 会分别回到 $10^{23}$ 与 $10^{24}$，这是一个很有用的单元测试。
+
+<AssignmentStepper items={[
+  'JSON 共 72 个 run，按 compute 得到 9 组',
+  '每组先画 N-loss，确认最低点不是无意落在边界',
+  '直接选择最低 loss 的 Nopt，并由 C/(6Nopt) 算 Dopt',
+  'log–log OLS 拟合 A、a、B、b',
+  '图上同时显示观测 minima、拟合线、1e23/1e24 外推位置',
+  '打印结果并验证 6ND=C'
+]} />
+
+## 2. 读懂真实训练 API
+
+所有 API request 都在 `X-API-Key` header 放 8 位 Stanford ID，并且必须从 Stanford network/VPN 访问。不要把 key 写进 notebook 或 Git；配套 client 从环境变量读取：
+
+```powershell
+$env:CS336_API_KEY='06123456'
+```
+
+```python
+class TrainingAPI:
+    def __init__(self, api_key=None, base_url='http://hyperturing.stanford.edu:8000'):
+        self.api_key = api_key or os.environ.get('CS336_API_KEY')
+        if not self.api_key:
+            raise ValueError('set CS336_API_KEY')
+        self.session = requests.Session()
+        self.session.headers.update({'X-API-Key': self.api_key})
+```
+
+完整、带 budget guard 的实现见 [`api_workflow.py`](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment3/api_workflow.py)。
+
+### 2.1 budget 是“预留”，完成后才按实际结算
+
+`POST /submit` 后，queued/running experiment 立即用完整 `max_runtime_seconds` 占用 12 小时预算。完成或失败时，API 才把计费改为实际 runtime，并裁剪在 1 秒与 max runtime 之间；若 timeout，则收满 max runtime。因此不能一次提交很多夸大的 timeout，把全部预算锁住。
+
+提交前先读 `/budget`：
+
+```python
+def submit(self, config):
+    reserve = float(config['max_runtime_seconds'])
+    remaining = float(self.budget()['remaining_seconds'])
+    if reserve > remaining:
+        raise RuntimeError(f'need {reserve}s, only {remaining}s remains')
+    return self._request('POST', '/submit', json=config)
+```
+
+相同 config 重复提交返回 HTTP 409，且不会再次占预算。要复现同一超参数，应更换 `model_seed`，并把 seed 明确纳入 config。
+
+### 2.2 一个合法 config 要满足什么
+
+architecture 必须包含 attention bias、head dim、hidden size、intermediate size、attention heads、hidden layers、KV heads、RMS epsilon、RoPE theta、是否 tied embeddings、dtype 与 vocab。重要约束：
+
+- `hidden_size == num_attention_heads * head_dim`；
+- attention heads 能被 KV heads 整除；
+- dtype 只能是 `float32` 或 `bfloat16`；
+- context length 固定 512、vocab 固定 32,000；
+- `total_train_tokens` 必须被 `512 * train_batch_size` 整除；
+- max runtime 为 1 秒到 12 小时；
+- mean next-token CE 在 512-token sequences 上计算；模型没有 dropout。
+
+配套 [`architecture.py`](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment3/architecture.py) 把连续 Nopt 映射到合法离散 shape。题面估算 non-embedding parameters 为：
+
+$$N\approx12\,n_{layers}\,d_{model}^2.$$
+
+```python
+def nearest_architecture(target_parameters):
+    candidates = []
+    for hidden in range(256, 8193, 64):
+        for layers in range(4, 129):
+            estimate = 12 * layers * hidden**2
+            error = abs(math.log(estimate / target_parameters))
+            d_ff = round_to_multiple(8 * hidden / 3, 128)
+            candidates.append((error, hidden, layers, d_ff))
+    return min(candidates)
+```
+
+为什么用 log error？把目标放大 20% 与缩小 20% 应受到近似对称惩罚；直接 absolute parameter error 会天然偏向小模型。
+
+### 2.3 run 状态与 validation loss
+
+训练被切成 `n_evals` 个 chunks，每块训练 `total_train_tokens/n_evals` tokens，然后验证，loss 序列位于 `status.val_losses`。只有 `status_type == "completed"` 时，最后一个元素才是该 run 的 final validation loss。timeout/failed 可能带 partial losses，可用于诊断学习率或粗看吞吐，但不能冒充完成训练的 final loss 放进同一拟合。
+
+数据顺序固定、无 epoching，最多使用 500B tokenized DCLM tokens；同一配置消费相同的确定性顺序。`model_seed` 只控制模型初始化，不改变 data order。验证集为约 $2^{18}=262,144$ tokens；final leaderboard 会使用更多 validation tokens，因此小验证集上的微小差距也含 sampling noise。
+
+## 3. 用 12 小时买到最有信息的 runs
+
+### 3.1 先写实验表，再发请求
+
+一个保守的最大预留方案如下；完成得早会返还预算，但决策时不要依赖返还：
+
+| 阶段 | 数量 × max runtime | 上限 | 要回答的问题 |
+|---|---:|---:|---|
+| API/吞吐 pilots | 6 × 120s | 0.20h | config 合法吗？loss 会降吗？每种 shape 的 tokens/s？ |
+| 四条 IsoFLOPs profiles | 5 × (300+600+1200+2400)s | 6.25h | 每个 C 的 U 形最低点在哪里？ |
+| LR/batch 局部 sweep | 8 × 600s | 1.33h | 默认优化器是否系统性压低某些模型？ |
+| held-out + seed repeats | 4 × 900s | 1.00h | 外推能预测未参与拟合的 budget 吗？关键点噪声多大？ |
+| 故障与边界扩展储备 | — | 3.22h | timeout、边界最低点、补测 |
+
+每个候选 run 提交前写一句“这个 run 会区分哪两个决策”。若答案只是“多一个点可能有用”，先不要花预算。
+
+### 3.2 怎样构造每条 profile
+
+1. 用 pilots 测不同 shape 的有效训练速率：`effective_flops_per_second = 6*N*D/used_runtime_seconds`；
+2. 选几何递增的 C 档，而不是在线性尺度平均撒点；
+3. 对每档围绕预估 Nopt 取乘数 `[0.4, 0.65, 1.0, 1.55, 2.5]`；
+4. 对每个 N 用 `D=C/(6N)`，再向下对齐 `512*batch`；
+5. 固定 optimizer、data、seed，避免把学习率变化误认为 scaling；
+6. 若最低 loss 位于最小/最大 N，说明尚未包住谷底，必须用储备向外扩一格。
+
+<ExecutionTrace title="一次 IsoFLOPs 实验如何变成数据点" steps={[
+  { label: 'target C', title: '选择 compute 档', input: 'geometric compute grid', output: 'C_i', explanation: '多档 C 负责确定幂律斜率；相邻档应有明显尺度差，同时仍可在 12 小时完成。' },
+  { label: 'choose N', title: '横向扫描模型大小', input: 'N multipliers around expected optimum', output: 'five architectures', explanation: '每档至少覆盖谷底两侧；只测预期最低点无法确认曲线方向。' },
+  { label: 'derive D', title: '保持等 FLOPs', input: 'C_i and N_ij', output: 'D_ij=C_i/(6N_ij)', explanation: '将 D 对齐 API 的 batch×512 quantum，并记录对齐后真实 6ND。' },
+  { label: 'train', title: '等待 completed', input: 'valid API config', output: 'final val loss + actual runtime', explanation: 'queued/running 按 max runtime 预留；failed/timeout 不进入 final-loss fit。' },
+  { label: 'minimum', title: '定位谷底', input: 'five N-loss points', output: 'Nopt(C_i), Dopt(C_i)', explanation: '边界最低点触发扩展；内部最低点进入 power-law fit。' }
+]} />
+
+### 3.3 throughput 不能只用一个常数
+
+最终预算是 48 B200 wall-clock hours，而 scaling 公式使用 FLOPs。先用 completed runs 估计不同 shape 的 effective FLOP/s，至少对 `log throughput` 回归 `log N`、depth/width ratio、batch、dtype 等变量，或在最终候选附近用局部实测。然后把 48 小时换为候选 shape 实际能执行的 C/D。
+
+如果预测 `Dopt` 在 48 小时内无法处理，就不能仍提交它；应在时间可行集合上重新最小化 predicted loss。反之若 run 提前处理完 Dopt，额外 token 可能继续降低 data-limited term，需比较更大 D 的候选。
+
+## 4. 两种拟合互相校验
+
+### 4.1 方法 A：IsoFLOPs minima → 两条 power laws
+
+这就是第 1 节的方法。优点是直观、参数少；缺点是每档只留下一个最低点，丢掉其他 run 信息，而且网格粗糙会让 minima 跳动。报告每条 profile 的原始点、最低点是否内部、log residual 与 held-out 预测误差。
+
+### 4.2 方法 B：拟合完整 Chinchilla loss surface
+
+常见形式：
+
+$$L(N,D)=E+\frac{A}{N^\alpha}+\frac{B}{D^\beta}.$$
+
+$E,A,B,\alpha,\beta$ 都应为正。配套 [`scaling_fit.py`](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment3/scaling_fit.py) 在 log-parameterization 下用 `scipy.optimize.least_squares` 和 soft-L1 robust loss：
+
+```python
+def decode(theta):
+    E, A, alpha, B, beta = np.exp(theta)
+    return ChinchillaLaw(E, A, alpha, B, beta)
+
+def residual(theta):
+    law = decode(theta)
+    return (law.predict(N, D) - losses) / losses
+
+result = least_squares(residual, initial, loss='soft_l1', f_scale=0.02)
+```
+
+用 relative residual 是为了不让少数高 loss pilots 因绝对数值更大而支配拟合。固定 C 后令 $D=C/(6N)$，在 log N 上做 bounded scalar minimization即可得到 Nopt/Dopt/predicted loss。
+
+不应只报告 optimizer 的一个点估计。对 completed runs 做 bootstrap，每次有放回重采样、重新拟合并重新求最优，报告 Nopt/Dopt/loss 的 5/50/95 percentiles。如果两种拟合方法给出相差很大的最优配置，这本身就是重要证据：应把剩余预算花在二者分歧最大的区域，而不是草率平均。
+
+### 4.3 held-out 检查
+
+至少留出一整档 compute 不参与拟合。用 scaling law 预测它的 Nopt 与 loss，再看真实 profile；报告：
+
+- predicted/observed Nopt ratio；
+- predicted loss 与 observed minimum 差；
+- 残差是否随 N 或 C 呈系统趋势；
+- seed repeat 的差异是否大于候选间差异。
+
+若 residual 有明显曲线，幂律范围可能过宽；若大模型一侧系统偏差，learning rate 或 runtime/throughput 可能没有正确随规模调整。
+
+## 5. 从连续 Nopt 落到最终 config
+
+scaling law 给的是连续参数量，不会自动告诉你 layers、width、heads、batch 与 learning rate。按以下顺序固定：
+
+1. 用 `nearest_architecture(Nopt)` 生成目标附近 2–3 个合法 shapes；
+2. 用源码真实统计参数量，不能只依赖 $12Ld^2$ 近似；
+3. head_dim 先保持 64，保证 heads×head_dim=hidden；
+4. `intermediate_size` 取接近 $8d/3$ 的 128 倍数；
+5. 在小规模 runs 中拟合/观察最佳 peak LR 随 N 或 batch 的变化；
+6. batch 要兼顾吞吐、steps 数与 token divisibility，不因 batch 变大就忘记调整 LR；
+7. 根据局部 throughput 选择 48 小时内可完成的 `total_train_tokens`；
+8. 用 loss surface 预测 final loss，并带上 bootstrap interval；
+9. 在真正 `POST /final_submission` 前保存完整 JSON、拟合代码 commit 与图表。
+
+`api_workflow.submit_plan()` 默认只打印计划和最大预留总量，只有显式 `execute=True` 才会消费预算：
+
+```python
+submit_plan(Path('planned-runs.json'))                 # dry run
+submit_plan(Path('planned-runs.json'), execute=True)   # 审核后才执行
+```
+
+最终 submission 可以重复提交，最新一次覆盖旧值。先 GET `/final_submission` 复核 server 保存的 config 与 predicted loss。
+
+<Accordions>
+  <Accordion title="每条 IsoFLOPs 最低点都在最大模型">搜索没有包住谷底，不能把边界点当可靠 Nopt。向更大 N/更小 D 扩一档；同时检查最大模型是否因 timeout 只拿了 partial loss。</Accordion>
+  <Accordion title="C=6ND 相同，runtime 却差很多">6ND 忽略了硬件利用率。过窄/过深模型、batch 太小、不同 dtype 与 kernel shape 都会改变 FLOP/s。用 pilots 对候选 architecture 建局部 throughput 模型。</Accordion>
+  <Accordion title="重复提交返回 409">API 把完全相同 training config 视为 duplicate。若是 seed repeat，改变 `model_seed`；若只是误点，不会新增预算占用。</Accordion>
+  <Accordion title="running 超过 max runtime 还没结束">running 状态包含 startup 与 preemption 的等待；计费使用最终报告的训练 runtime，并裁剪到 max runtime。继续轮询，不要把 UI 墙钟等待直接当训练用时。</Accordion>
+  <Accordion title="loss surface 拟合出负指数或负 E">用 log-parameterization 强制正值，并检查 N/D 覆盖是否足够。只有单条近似一维轨迹时，五个参数可能不可辨识，需要横向 profile 点。</Accordion>
+</Accordions>
+
+---
+
+## 作业文档完整中文译文
+
+以下按 Assignment 3 v26.0.5 的原文顺序翻译，保留接口字段、数值与交付物，便于逐页核对。
+
+### 1. 作业概览（原文第 1–2 页）
+
+本作业让你亲手接触 language model scaling laws。
+
+设定是：你负责训练 ClosedAI 的下一代语言模型。它会消耗一个小国 GDP 并融化南极冰架，所以必须尽量一次做对。具体而言，你得到一个以 wall-clock time 度量的固定 compute budget，目标是产生 training loss 最低的模型，也就是 compute-optimal model。你需要决定如何权衡两件事：训练更大的模型，或训练更多 tokens。
+
+Scaling laws 用经验关系把 language-model training loss 与 model size、training compute 联系起来，常用于预测这种权衡。你将在本作业构建 scaling laws，估计使用 48 B200-hours 训练时的 compute-optimal model size 与对应 hyperparameters。你不必自己运行底层训练代码，而是向 training API 提交：模型超参数，包括 Transformer 层数、embedding size、heads、batch、learning rate、training tokens 等；以及该 experiment 允许的最大 wall-clock time。API 返回对应训练的 validation loss。
+
+拟合 scaling law 的额外预算为 12 B200-hours，即大 run FLOPs budget 的 25%。API 接受很宽的超参数范围；怎样选择要探索的 search-space 区域、让 12 小时信息量最大，也是作业的一部分。
+
+本文档和代码位于 [assignment3-scaling](https://github.com/stanford-cs336/assignment3-scaling)。请用 Git clone；若有更新，课程会通知并可 `git pull`。
+
+Gradescope 提交包括：`writeup.pdf`，完整描述 scaling-law 拟合方法、怎样预测给定 FLOPs budget 的 optimal model size，细节应足以复现；`code.zip`，包含所有拟合和估计代码。此外，把预测的最佳 hyperparameters 与 final validation loss 提交到 API。部分成绩由预测配置最终训练出的性能决定。
+
+#### AI tools 声明
+
+AI 能完全自主解决作业的许多部分，这会让深入参与课程材料并从中学习变得更困难。课程允许 AI 回答高层概念问题，或提供函数签名、library API 等低层编程文档；不允许 AI 实现任何作业部分，包括 coding agents（例如 Cursor Agents、Codex、Claude Code）与 AI autocomplete（例如 Cursor Tab、GitHub Copilot）。使用 AI agent 时应让它遵守仓库中的 `AGENTS.md`；使用 chatbot 时还应附上 prompt。课程强烈建议完成作业时关闭 IDE 的 AI autocomplete，但普通的函数名补全完全可以。往届学生反馈关闭 AI autocomplete 更容易深入投入材料。完整规则见课程 AI Policy 文档。
+
+### 2. Scaling laws 回顾（原文第 2–3 页）
+
+本节复习 Chinchilla 论文的一种拟合方法。核心问题是：给定训练大语言模型的 compute budget C，选择什么 model size、training tokens 等 hyperparameters 能得到最低 training loss？主要挑战是怎样从较小规模实验外推到更大规模。第二部分可以加入 Kaplan 等人与 Tensor Programs V 等其他资料的方法。
+
+#### 2.1 IsoFLOPs profiles
+
+有 N 个参数、D 个数据 tokens 的 Transformer，训练 compute 近似 $C=6ND$。Chinchilla 的 IsoFLOPs 方法为：对每个 C，训练不同 N 的模型，同时令 $D=C/(6N)$，得到各自 final training loss L。
+
+这样会产生多组 runs：同一组使用相同 $C_i$，但 model size $N_{ij}$ 不同。Hoffmann 等人经验上观察到，在固定 $C_i$ 时，final loss 与 model size 近似二次关系。直觉是：N 极小时，无论投入多少 compute，模型都没有 capacity 拟合数据，loss 很高；N 增大时 loss 平滑下降；超过某点后，模型太大，固定 C 无法提供足够 gradient steps，训练不充分，loss 又升高。极端地，$N\to\infty$ 时连一步 gradient update 都超过 C，训练会在很高 loss 停止。
+
+拟合流程先在每个 $C_i$ 找 optimal model/data size，再拟合 power law，用比已有 runs 更大的 target C 预测 N/D。对每个 IsoFLOPs profile，选择 loss 最低的 $N_{opt}(C_i)$，得到成对数据 $\langle C_i,N_{opt}(C_i)\rangle$；Dopt 同理。拟合 $N_{opt}\propto C^a$、$D_{opt}\propto C^b$，再外推目标预算。
+
+`chinchilla_isoflops` 题要求用 `data/isoflops_curves.json` 的 synthetic runs 复现。JSON 是对象数组，每个对象含 `parameters`、`compute_budget`、`final_loss`。可用 scipy，尤其 `scipy.optimize.curve_fit`，也可用其他拟合方法。虽然原论文对每条 profile 拟合 quadratic 再取 minimum，本题建议直接选择最低 training loss 的观测 run。
+
+(a) 展示拟合使用的 $\langle C_i,N_{opt}(C_i)\rangle$ 与外推 compute-optimal N。回答 $10^{23}$ 与 $10^{24}$ FLOPs 的预测 model size。提交一张 model size 对 compute budget 的 scaling-law 图，既有 fit points，也至少外推到 $10^{24}$，并用一句话写预测。
+
+(b) 用 $\langle C_i,D_{opt}(C_i)\rangle$ 做 dataset size scaling law，回答 $10^{23}$ 与 $10^{24}$ FLOPs 的 predicted dataset size。提交相应图与一句话预测。
+
+### 3. 构建 scaling laws（原文第 3–8 页）
+
+本节在固定探索预算下，通过 training API 查询真实 runs 来拟合。主要目标是选择在 48 B200-hours 上 validation loss 最低的 model size 与 hyperparameters，并预测其 loss。为了设置目标规模的 hyperparameters，建议先分析小规模中各 hyperparameter 如何影响 validation loss。开始前必须仔细计划；超过 12 B200-hours 后 API 会拒绝更多请求。
+
+#### 3.1 Training run 细节
+
+API 在 B200 GPU 上运行真实训练。提交后 experiment 进入共享 queue。queued 与 running experiments 会按各自完整 `max_runtime_seconds` 预留 12 小时预算。完成或失败后，API 用报告的实际 runtime 重算费用，并把它限制在至少 1 秒、至多 max runtime。若一个预留 30 分钟的 run 在 12 分钟完成，18 分钟归还；timeout 收取完整 max runtime。
+
+每个 job 训练 `n_evals` 个 chunks，每块处理 `total_train_tokens/n_evals` tokens，随后验证，并把 loss 序列放在 `status.val_losses`。completed experiment 的 final validation loss 是列表最后一项。timeout failed experiment 可能返回 partial losses，但它不是 completed run。
+
+数据顺序固定。training data 是最多 500B tokens 的 tokenized DCLM，不做 epoching；每个配置消费同一确定性 token 顺序。validation set 使用 $2^{18}$ 个 validation tokens，final leaderboard 会用更多。`model_seed` 只控制 model initialization，不控制 data order。
+
+模型架构基本和 A1 相同，有少量差异；仓库提供源码参考。training code 仅供阅读，只能通过 API 训练。数据词表 32K，context 512。API 支持 AdamW 与 SGD，均有 warmup-cosine schedule。示例用 AdamW、weight decay 0.01、gradient clipping 1.0、warmup fraction 0.05、final LR fraction 0.1。训练 loss 是 512-token sequences 上的 mean next-token cross entropy；模型无 dropout。
+
+#### 3.2 Training API
+
+API key 是 8 位 Stanford ID，例如 06123456。必须位于 Stanford network，可能需要 VPN。可以访问 `http://hyperturing.stanford.edu:8000/docs` 做连通性检查，并用 `/budget` 验证 key。所有 request 的 header 都应含 `X-API-Key`。
+
+`POST /submit` 接受一个 training config 并把 run 加入 queue，返回 experiment id。request body 字段如下：
+
+- `architecture_config`：含 `attention_bias`、`head_dim`、`hidden_size`、`intermediate_size`、`num_attention_heads`、`num_hidden_layers`、`num_key_value_heads`、`rms_norm_eps`、`rope_theta`、`tie_word_embeddings`、`dtype`、`vocab_size`；dtype 只能是 `float32` 或 `bfloat16`；
+- `optimizer_config`：AdamW 或 SGD 配置，题面示例使用 AdamW；
+- `train_batch_size`、`val_batch_size`：整数 batch sizes；
+- `n_evals`：训练期间 validation 次数；
+- `total_train_tokens`：总训练 token；
+- `max_runtime_seconds`：预留的最大墙钟时间，1 秒到 12 小时；
+- `model_seed`：初始化随机种子。
+
+API 固定 `seq_len=512`，validation tokens 为 $2^{18}\approx262K$，并检查一致性：hidden size 等于 heads×head dim；attention heads 能被 KV heads 整除；total tokens 能被 `512*train_batch_size` 整除等。
+
+response 含 `experiment_id` 与 `budget_summary`；后者含 used、remaining、total seconds。同一 config 重复提交返回 409，不额外预留预算；max runtime 大于 remaining budget 返回 400。
+
+题面完整示例 architecture 为 head_dim 64、hidden 448、intermediate 1280、7 heads、9 layers、7 KV heads、RMS epsilon 1e-6、RoPE theta 1,000,000、untied embeddings、BF16、vocab 32,000。optimizer scheduler peak LR 3e-4、final fraction 0.1、warmup 0.05、initial 0；weight decay 1e-2、betas 0.9/0.95、eps 与 eps_root 1e-8、grad clip 1.0。train batch 128、val batch 32、16 evals、1,048,576 tokens、max runtime 30 秒、seed 0。POST 成功示例返回 experiment 1，used 30、remaining 43170、total 43200 秒。
+
+`GET /budget` 返回当前 key 的 `used_seconds`（已用或已预留）、`remaining_seconds`、`total_budget_seconds`。
+
+`GET /experiments` 返回当前 key 提交的全部 experiments。每个对象含 id、training config 与 status。`queued` 表示等待；`running` 表示运行，并可能含目前观测的 val losses。running 状态包含 startup 与 preemption，所以显示时间可能超过 max runtime。`completed` 含 actual used runtime、val losses 与 completion time。`failed` 表示 crash 或 timeout；timeout 可能含 partial losses。
+
+`GET /experiment/{experiment_id}` 返回单个 experiment，格式与列表 entry 相同。应轮询直到 `status.status_type == "completed"`，并把 `status.val_losses[-1]` 作为该 completed run 的 final validation loss。
+
+`POST /final_submission` 提交 predicted optimal `training_config` 与 `predicted_final_loss`。可重复提交，最新一次覆盖旧 submission。`GET /final_submission` 返回当前 submission；若从未提交则为 None。
+
+#### 3.3 Leaderboard / `scaling_laws`
+
+现在用 API 为 48 B200-hour run 选择 model config，目标是让最终 validation loss 最低。
+
+题目要求构建 scaling law，并用它选择预期在 48 B200-hours 达到最低 validation loss 的 model size 与 hyperparameters，同时预测 loss。用于拟合的 API experiments 总量不得超过 12 B200-hours，这是 server 强制的硬上限。
+
+提交一份排版报告，完整描述方法与拟合过程；说明怎样从 law 预测给定 FLOPs budget 的 optimal model size 及预测值；解释关键 design decisions；细节足以让他人复现。48 小时 final run 的 hyperparameters 基本不受额外限制，所有 runs 都在单张 B200 上。
+
+报告至少讨论：怎样在固定 12 小时预算内选择 queries；怎样具体拟合，建议熟悉 Kaplan 与 Chinchilla 方法；law 对 experimental data 拟合得多好；48 B200-hours 下预测的 optimal model size 与 loss；若训练该参数量模型，会用什么 hyperparameters。给定 architecture 的 non-embedding parameter estimate 使用 $12n_{layer}d_{model}^2$。
+
+除报告外，还要向 API 提交预测的 optimal hyperparameters 与 validation loss。部分成绩取决于该预测模型的真实性能。
+
+### 参考文献
+
+1. Jared Kaplan 等，[Scaling Laws for Neural Language Models](https://arxiv.org/abs/2001.08361)，2020。
+2. Jordan Hoffmann 等，[Training Compute-Optimal Large Language Models](https://arxiv.org/abs/2203.15556)，2022。
+3. Greg Yang 等，[Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer](https://arxiv.org/abs/2203.03466)，2022。

@@ -9,7 +9,11 @@
 /.next/
 /out/
 /build
+/tmp
 *.tsbuildinfo
+.pytest_cache/
+__pycache__/
+*.py[cod]
 
 # misc
 .DS_Store

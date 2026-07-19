@@ -1,73 +1,970 @@
 ---
 title: Assignment 4 · Data
-description: 构建可审计的 Common Crawl 过滤与去重流水线，并用固定训练配方比较数据。
+description: 从 Common Crawl 原始记录出发，完整实现抽取、语言识别、隐私掩码、质量过滤、MinHash 去重、并行流水线、tokenize 与固定配方训练。
 ---
 
-## 先培养“数据感觉”
+## 这一章最终会产出什么
 
-先人工看 25 个网页：语言、页面类型、正文比例、模板噪声、重复、隐私和训练价值。WARC 保存原始响应，WAT 是元数据，WET 是抽取文本；题面先让你理解格式，再处理英语 WET 列表。
+A4 的中心问题不是“怎样下载更多网页”，而是：
 
-## 第一阶段：抽取、语言与 PII
+> 怎样把来源复杂、格式混乱、重复且带风险的网页，变成可审计、可复现、对目标验证分布真正有用的训练 token？
 
-HTML 抽取用 FastWARC 遍历 response record、处理编码，再由 Resiliparse 取正文。`test_extract.py` 与固定 Moby Dick 结果逐字比较，说明空白和段落边界也是契约。
+最终流水线是：
 
-fastText language ID 返回短标签与正 score；PII mask 必须使用题面精确占位符。regex 只是启发式：IPv4 四段需限制 0–255；电话会误伤日期、订单号；已有 mask 不应重复计数。
+~~~text
+WARC HTML / English WET
+  → 字节解码与正文抽取
+  → 语言与目标域筛选
+  → Gopher 结构规则
+  → NSFW / toxic 分类
+  → learned quality 分类
+  → PII 掩码
+  → 全语料精确行去重
+  → MinHash + LSH 文档去重
+  → GPT-2 tokenizer + EOS
+  → uint16 训练文件
+  → 固定 430M 模型配方比较 validation perplexity
+~~~
 
-## 第二阶段：质量与 harmful content
+可运行实现位于 [examples/assignment4](https://github.com/Palind-Rome/cs336-learning-journey/tree/main/examples/assignment4)。抽取、PII、Gopher 与两种去重已接到课程原始 adapters；18 项不依赖两份超大 Dolma 权重的官方测试通过。语言测试使用官方 <code>lid.176.ftz</code>。Dolma 两份模型各约 946 MiB，所以代码读取本地权重路径，不把模型二进制提交进 Git。
 
-Gopher 必做规则包括词数 50–100,000、平均词长 3–10、以 `...` 结尾行比例不超过 30%、至少 80% 词含字母。测试决定“word”的具体解析方式，别凭直觉改定义。
-
-NSFW/toxic 与 wiki-vs-CC 质量分类器都要在真实样本上审计阈值。分类器训练域与网页域不同会 domain shift；输出 kept/dropped、分数分布、误杀/漏网样本，而不是只给一个保留率。
-
-## 第三阶段：两种去重
-
-精确行去重必须跨全语料两遍：第一遍稳定 hash 计频，第二遍只保留全局唯一行，同时仍输出所有同名文件。不要用跨运行随机化的 Python `hash()`。
-
-模糊去重：lowercase、去标点、统一空白、Unicode NFD 后去 combining marks；构造 n-gram 集合、MinHash signature、LSH band 候选，再验证真实 Jaccard。候选关系有传递性，使用并查集得到簇并选代表。
-
-```text
-P(成为候选 | 相似度 s) = 1 − (1 − s^r)^b
-```
-
-固定 signature 长度时，更多 band 通常提高 recall 也增加假候选。LSH 只负责找候选，不应“同 band 就直接删除”。
-
-## 第四阶段：组合与训练
-
-每篇文档加 GPT-2 EOS，token ids 存 `np.uint16`。固定模型约 430M 参数、context 512、8 GPU、每卡 batch 128、16,384 steps，因此训练约 `8×128×512×16384 = 8.59B` token。只改变数据，才能把验证差异归因于流水线。
-
-<AssignmentStepper items={[
-  'HTML/语言/PII 三组窄测试通过',
-  '质量和 harmful 阈值有人工审计表',
-  '精确行去重是全局两遍且保留文件结构',
-  'MinHash 候选再由真实相似度验证',
-  '每个 filter 记录原因与样本',
-  'tokenize 时文档间有 EOS 且 dtype 正确',
-  '训练未混入固定验证数据'
+<TermDeck title="数据工程词汇卡" items={[
+  { term: 'CC', expansion: 'Common Crawl', chinese: '公共网页抓取语料', explanation: '非营利组织持续发布的大规模网页抓取。它提供原始网页，不等于已经可以训练的高质量文本。' },
+  { term: 'WARC', expansion: 'Web ARChive', chinese: '网页归档格式', explanation: '保存 URL、HTTP 元数据和原始响应正文。若要重新做 HTML 正文抽取，应从 WARC 开始。', example: 'response record → HTTP payload → HTML bytes' },
+  { term: 'WAT', expansion: 'Web Archive Transformation', chinese: '网页元数据格式', explanation: '从 WARC 派生的 JSON 元数据，例如标题、链接和 HTTP 信息；一般不含完整正文。' },
+  { term: 'WET', expansion: 'Web Extracted Text', chinese: '抽取文本格式', explanation: 'Common Crawl 已从网页中抽出的纯文本，仍带 record headers，也可能保留菜单和页脚噪声。' },
+  { term: 'PII', expansion: 'Personally Identifiable Information', chinese: '个人可识别信息', explanation: '可以联系或识别个人的信息。本作业处理邮箱、电话号码和 IPv4；掩码只能降低风险，不能证明语料已无隐私信息。' },
+  { term: 'NSFW', expansion: 'Not Safe For Work', chinese: '不宜公开场合展示内容', explanation: '课程用 Dolma/Jigsaw fastText 模型给出二分类标签与置信度。它与 toxic speech 是两个不同分类器。' },
+  { term: 'MinHash', chinese: '最小哈希签名', explanation: '用多个随机哈希函数各自的最小值压缩 n-gram 集合；两个集合某一维签名相同的概率等于其 Jaccard 相似度。' },
+  { term: 'LSH', expansion: 'Locality-Sensitive Hashing', chinese: '局部敏感哈希', explanation: '把 MinHash signature 分 band；任一 band 完全相同的文档成为候选对，从而避免比较所有文档对。' },
+  { term: 'precision', chinese: '精确率', explanation: '判为应删除的文档中，真正重复或低质的比例。低 precision 意味着误删多。' },
+  { term: 'recall', chinese: '召回率', explanation: '所有应删除文档中，过滤器实际找出的比例。低 recall 意味着漏网多。' },
+  { term: 'perplexity', chinese: '困惑度', explanation: '语言模型平均负对数似然的指数，PPL=exp(loss)。越低表示给真实下一个 token 的概率总体越高。' },
+  { term: 'Paloma', chinese: '语言模型分布适配基准', explanation: '本作业用 C4 100 domains 子集做固定验证目标。允许用验证分布设计过滤器，但绝不能把验证文本复制进训练集。' }
 ]} />
 
-## 测试契约速查
+## 0. 环境、模型与 adapters
 
-`tests/adapters.py` 是 11 个入口。语言需映射 `en/zh`；mask 字符串为 `|||EMAIL_ADDRESS|||`、`|||PHONE_NUMBER|||`、`|||IP_ADDRESS|||`；harmful 标签使用 `nsfw/non-nsfw` 与 `toxic/non-toxic`；质量标签为 `wiki/cc`。去重测试检查输出文件数量与指定 license 的簇关系。
+~~~bash
+uv sync
 
-| Adapter | 输入/输出与检查重点 |
+# 官方语言识别模型：.bin 更快且略准，.ftz 是 917 KB 压缩版
+wget https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin
+
+wget https://dolma-artifacts.org/fasttext_models/jigsaw_fasttext_bigrams_20230515/jigsaw_fasttext_bigrams_nsfw_final.bin
+wget https://dolma-artifacts.org/fasttext_models/jigsaw_fasttext_bigrams_20230515/jigsaw_fasttext_bigrams_hatespeech_final.bin
+~~~
+
+fastText 官方说明 <code>lid.176</code> 支持 176 种语言、输入应为 UTF-8。课程指定的 Dolma 模型真实标签是：
+
+| 模型 | 负标签 | 正标签 |
+|---|---|---|
+| NSFW | <code>__label__non-nsfw</code> | <code>__label__nsfw</code> |
+| toxic speech | <code>__label__non-toxic</code> | <code>__label__toxic</code> |
+| 自训质量模型 | <code>__label__cc</code> | <code>__label__wiki</code> |
+
+不能用 <code>"nsfw" in label</code> 判断正类，因为 <code>non-nsfw</code> 也包含相同片段。必须完整匹配，未知标签立即报错：
+
+~~~python
+class BinaryHarmClassifier(FastTextClassifier):
+    def __init__(
+        self, model_path, positive_output, negative_output,
+        positive_labels, negative_labels,
+    ):
+        super().__init__(model_path)
+        self.positive_output = positive_output
+        self.negative_output = negative_output
+        self.positive_labels = {self._normalize(x) for x in positive_labels}
+        self.negative_labels = {self._normalize(x) for x in negative_labels}
+
+    @staticmethod
+    def _normalize(label):
+        return label.removeprefix("__label__").lower().replace("-", "_")
+
+    def classify(self, text):
+        label, score = self.predict(text)
+        normalized = self._normalize(label)
+        if normalized in self.positive_labels:
+            return self.positive_output, score
+        if normalized in self.negative_labels:
+            return self.negative_output, score
+        raise ValueError(f"unexpected classifier label: {label!r}")
+~~~
+
+<code>tests/adapters.py</code> 应保持很薄：加载并缓存模型、规范化名字、转发参数；算法主体放进 <code>cs336_data</code>。这样单函数测试与完整流水线共用同一实现。
+
+## 1. WARC、WAT、WET 不要混
+
+WARC 的 response record 有两层：
+
+~~~text
+WARC headers
+  WARC-Target-URI: https://example.org/page
+  WARC-Date / WARC-IP-Address / ...
+
+HTTP response headers
+
+<html>原始响应字节</html>
+~~~
+
+WET 是 Common Crawl 已抽取的文本；record header 仍在，payload 已是纯文本。WET 适合大规模文本过滤，WARC 适合自行控制正文抽取，WAT 主要用于标题、链接图和 metadata。
+
+不要手写 gzip 分隔逻辑，使用 FastWARC：
+
+~~~python
+import gzip
+from fastwarc.warc import ArchiveIterator, WarcRecordType
+
+with gzip.open("example.warc.gz", "rb") as stream:
+    for record in ArchiveIterator(
+        stream, record_types=WarcRecordType.response
+    ):
+        url = record.headers.get("WARC-Target-URI", "")
+        html_bytes = record.reader.read()
+        print(url, len(html_bytes))
+~~~
+
+若输入 WET，record type 改为 <code>WarcRecordType.conversion</code>。
+
+人工查看 25 条时要留下结构化证据：
+
+| idx | URL/domain | 语言 | 页面类型 | 主文比例 | 模板噪声 | PII/风险 | keep/drop 与理由 |
+|---:|---|---|---|---:|---|---|---|
+| 0 | … | en | article/forum/product/404 | 0–1 | menu/footer/cookie | none/email/... | … |
+
+“高质量”依赖目标：代码 API 页面适合代码模型，却可能偏离自然语言新闻目标。标注表的用途是形成可检验假设。
+
+## 2. HTML bytes → Unicode → 主文本
+
+直接用 <code>errors="ignore"</code> 会静默丢字符。合理顺序是严格 UTF-8 快路径，失败后检测编码，仍失败才 replacement decode：
+
+~~~python
+from resiliparse.extract.html2text import extract_plain_text
+from resiliparse.parse.encoding import detect_encoding
+
+def decode_html(html_bytes: bytes) -> str:
+    try:
+        return html_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        encoding = detect_encoding(html_bytes) or "utf-8"
+        return html_bytes.decode(encoding, errors="replace")
+
+def extract_text_from_html_bytes(html_bytes: bytes) -> str | None:
+    return extract_plain_text(decode_html(html_bytes))
+~~~
+
+完整代码见 [extraction.py](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment4/cs336_data/extraction.py)。官方测试与 Moby Dick fixture 逐字比较，因此换行、空白和段落边界也是接口契约，不要在 adapter 中另做 <code>strip</code>。
+
+<CheckpointQuiz
+  question="网页自报 latin-1，但字节能被严格 UTF-8 解码，上述实现先采用哪一种？"
+  options={['UTF-8，因为严格解码成功', 'latin-1，因为网页自报永远可信', 'ASCII，因为它最安全']}
+  answer={0}
+  explanation="生产系统可审计 header 与 detector 的冲突，但不能无条件信任网页声明；这里先走覆盖绝大多数页面的无损快路径。"
+/>
+
+比较自己抽取与 WET 时，应检查正文覆盖、菜单/页脚、链接锚文本、段落和乱码，而不是只比较字符数。
+
+## 3. 语言识别：标签、置信度与阈值
+
+~~~python
+import fasttext
+
+class FastTextClassifier:
+    def __init__(self, model_path):
+        self.model = fasttext.load_model(str(model_path))
+
+    def predict(self, text):
+        labels, probabilities = self.model.predict(
+            text.replace("\n", " "), k=1
+        )
+        return labels[0].removeprefix("__label__"), float(probabilities[0])
+
+class LanguageIdentifier(FastTextClassifier):
+    aliases = {"zh-cn": "zh", "zh-tw": "zh", "cmn": "zh"}
+
+    def identify(self, text):
+        label, score = self.predict(text)
+        label = label.lower()
+        return self.aliases.get(label, label), score
+~~~
+
+fastText 一行通常是一条样本，因此先把网页换行变空格。top-1 是英文不代表置信度足够；随机审计 20 条并对候选阈值计算：
+
+$$
+\text{precision}=\frac{TP}{TP+FP},\qquad
+\text{recall}=\frac{TP}{TP+FN}.
+$$
+
+过低阈值混入其他语言，过高阈值会丢掉代码、公式、短文和混合语言。课程英语 WET 用 <code>P(en) ≥ 0.70</code> 作为起点，但它不是普适常数。高风险产品还要按语言建验证集、审计低资源语言与 code switching、版本化阈值并做下游行为测试。
+
+## 4. PII：保守掩码、精确计数、承认边界
+
+<code>re.subn</code> 同时返回替换后文本与次数，正好对应 adapter：
+
+~~~python
+EMAIL_TOKEN = "|||EMAIL_ADDRESS|||"
+EMAIL_PATTERN = re.compile(
+    r"(?<![\w.+-])"
+    r"[A-Z0-9.!#$%&'*+/=?^_\x60{|}~-]+"
+    r"@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
+    r"(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+"
+    r"(?![\w-])",
+    re.IGNORECASE,
+)
+
+PHONE_TOKEN = "|||PHONE_NUMBER|||"
+PHONE_PATTERN = re.compile(
+    r"(?<![\w\d])"
+    r"(?:\+?1[\s.-]?)?"
+    r"(?:\(\s*\d{3}\s*\)|\d{3})"
+    r"[\s.-]?\d{3}[\s.-]?\d{4}"
+    r"(?![\w\d])"
+)
+
+IP_TOKEN = "|||IP_ADDRESS|||"
+OCTET = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+IPV4_PATTERN = re.compile(
+    rf"(?<![\d.])(?:{OCTET}\.){{3}}{OCTET}(?!\d|\.\d)"
+)
+
+def mask_emails(text):
+    return EMAIL_PATTERN.subn(EMAIL_TOKEN, text)
+
+def mask_phone_numbers(text):
+    return PHONE_PATTERN.subn(PHONE_TOKEN, text)
+
+def mask_ipv4_addresses(text):
+    return IPV4_PATTERN.subn(IP_TOKEN, text)
+~~~
+
+句末 <code>editor@example.com.</code> 应只替换邮箱、保留句号；<code>999.1.1.1</code> 不是 IPv4；已有 mask 不应重复计数。完整实现见 [pii.py](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment4/cs336_data/pii.py)。
+
+正则仍会误伤订单号/版本号，并漏掉姓名、住址、IPv6、国际号码或混淆写法。缓解方式包括上下文校验、多检测器、按域阈值、审计样本，以及高风险数据直接删除而非只掩码。
+
+## 5. harmful content：模型输出不是道德真值
+
+~~~python
+def load_nsfw_classifier(path):
+    return BinaryHarmClassifier(
+        path,
+        positive_output="nsfw",
+        negative_output="non-nsfw",
+        positive_labels={"nsfw"},
+        negative_labels={"non-nsfw", "non_nsfw"},
+    )
+
+def load_toxicity_classifier(path):
+    return BinaryHarmClassifier(
+        path,
+        positive_output="toxic",
+        negative_output="non-toxic",
+        positive_labels={"toxic"},
+        negative_labels={"non-toxic", "non_toxic"},
+    )
+~~~
+
+课程 sanity tests 来自 Jigsaw 评论，只证明接口与模型能跑，不证明总体准确。NSFW 和 toxic 要分别审计 20 条、分别统计分数和阈值。
+
+典型失败：引用/反驳有害言论被误删；身份词与 toxic 标签形成伪相关；Wikipedia 评论到一般网页发生 domain shift；短文、隐语、拼写变体和非英语漏检；过强过滤让模型失去识别或拒绝有害内容的上下文。边界样本可隔离到 quarantine，并报告误杀、漏检和保留率。
+
+## 6. Gopher 四条规则的精确实现
+
+题面要求删除：少于 50 或多于 100,000 words；平均词长不在 3–10；超过 30% 非空行以省略号结尾；少于 80% words 含字母。
+
+~~~python
+import regex
+
+WORD_PATTERN = regex.compile(
+    r"[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*"
+)
+
+def words(text):
+    return WORD_PATTERN.findall(text)
+
+def passes_gopher_quality_filter(text):
+    tokens = words(text)
+    if not 50 <= len(tokens) <= 100_000:
+        return False
+
+    mean_length = sum(map(len, tokens)) / len(tokens)
+    if not 3 <= mean_length <= 10:
+        return False
+
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    if lines:
+        ellipsis_fraction = (
+            sum(line.endswith("...") for line in lines) / len(lines)
+        )
+        if ellipsis_fraction > 0.30:
+            return False
+
+    alphabetic_fraction = (
+        sum(any(ch.isalpha() for ch in token) for token in tokens)
+        / len(tokens)
+    )
+    return alphabetic_fraction >= 0.80
+~~~
+
+边界要按文字理解：平均长度恰好 3/10 通过，恰好 30% ellipsis 通过。Unicode-aware regex 会把 <code>sentence.Next</code> 分成两个词。规则透明便宜，但会误删诗歌、代码、列表，也可能放过流畅 SEO 垃圾，所以只是 learned classifier 前的粗筛。
+
+## 7. learned quality：数据构造比模型 API 更关键
+
+课程提供 Wikipedia 外链 URL，子采样后抓为 WARC，正例是外链页，负例是随机 CC：
+
+~~~bash
+gzip -dc /shared-data/wiki/enwiki-20260501-extracted_urls.txt.gz \
+  | shuf -n 100000 > subsampled_positive_urls.txt
+
+wget --timeout=5 \
+  -i subsampled_positive_urls.txt \
+  --warc-file=subsampled_positive_urls.warc \
+  -O /dev/null
+~~~
+
+两类必须经过相同抽取和基本过滤，否则模型会学到抓取方式差异。train/validation/test 按 registered domain 切分，防止同站模板泄漏。
+
+~~~python
+def train_quality_classifier(
+    positive_documents, negative_documents, output_path, *, epoch=10
+):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", delete=False
+    ) as training_file:
+        training_path = Path(training_file.name)
+        for text in positive_documents:
+            training_file.write(
+                "__label__wiki " + " ".join(text.split()) + "\n"
+            )
+        for text in negative_documents:
+            training_file.write(
+                "__label__cc " + " ".join(text.split()) + "\n"
+            )
+    try:
+        model = fasttext.train_supervised(
+            input=str(training_path),
+            epoch=epoch, lr=0.2, wordNgrams=2,
+            dim=100, loss="softmax", thread=1,
+        )
+        model.save_model(str(output_path))
+    finally:
+        training_path.unlink(missing_ok=True)
+    return output_path
+~~~
+
+~~~bash
+python -m cs336_data.cli train-quality \
+  --positive "data/positive/*.jsonl.gz" \
+  --negative "data/negative/*.jsonl.gz" \
+  --output models/quality.bin
+~~~
+
+提高 threshold 通常提升 precision、降低 recall 和多样性。先在 domain-isolated holdout 画 PR curve，再用固定 token budget 小训练验证 Paloma loss；目标不是 classifier accuracy，而是下游分布适配。
+
+## 8. 精确行去重必须全局两遍
+
+<ExecutionTrace title="全语料精确行去重" steps={[
+  { label: 'hash', title: '变长行压成固定键', input: 'UTF-8 line', output: '128-bit BLAKE2b', explanation: '固定大小 key 降内存；不要用跨运行随机化的 Python hash。' },
+  { label: 'count', title: '第一遍统计全局频次', input: 'all files', output: 'Counter[hash]', explanation: '同文件内重复两次也计为 2。' },
+  { label: 'rewrite', title: '第二遍重写每个文件', input: 'line + global count', output: 'only count == 1', explanation: '每个输入仍创建同名输出；重复行在所有位置都删除。' }
+]} />
+
+~~~python
+def line_key(line):
+    return hashlib.blake2b(
+        line.encode("utf-8"), digest_size=16
+    ).digest()
+
+def exact_line_deduplicate(input_files, output_directory):
+    paths = [Path(path) for path in input_files]
+    output_directory = Path(output_directory)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    frequency = Counter()
+
+    for path in paths:
+        with xopen(path, "rt", encoding="utf-8") as file:
+            for line in file:
+                frequency[line_key(line)] += 1
+
+    for path in paths:
+        with (
+            xopen(path, "rt", encoding="utf-8") as source,
+            xopen(
+                output_directory / path.name,
+                "wt", encoding="utf-8",
+            ) as target,
+        ):
+            for line in source:
+                if frequency[line_key(line)] == 1:
+                    target.write(line)
+~~~
+
+128-bit hash 碰撞概率极低但非零；更严格系统可在同 hash bucket 内再核对原文，超大语料可用外部排序或分片 counter。
+
+## 9. MinHash + LSH：只对候选做真实比较
+
+规范化 word n-gram 集合后定义：
+
+$$J(S,T)=\frac{|S\cap T|}{|S\cup T|}.$$
+
+~~~python
+def normalize_for_deduplication(text):
+    text = unicodedata.normalize("NFD", text.lower())
+    text = "".join(
+        ch for ch in text
+        if unicodedata.category(ch) != "Mn"
+    )
+    text = re.sub(r"[^\w\s]", " ", text)
+    return " ".join(text.split())
+~~~
+
+先 NFD 再去 combining marks，<code>é</code> 才变为 <code>e</code>。对随机 hash $h$：
+
+$$
+\Pr[\min h(S)=\min h(T)]
+=\frac{|S\cap T|}{|S\cup T|}
+=J(S,T).
+$$
+
+用 $k$ 个 hash，签名相同维度比例估计 Jaccard。再把 $k=br$ 维切为 $b$ bands、每 band $r$ 行。相似度为 $s$ 的两文档成为候选的概率：
+
+$$P(\text{candidate}\mid s)=1-(1-s^r)^b.$$
+
+固定 $k$，增加 bands 会提高 recall、降低 precision。实现：
+
+~~~python
+def candidate_pairs(signatures, num_bands):
+    rows = len(signatures[0]) // num_bands
+    buckets = defaultdict(list)
+    candidates = set()
+    for doc_index, signature in enumerate(signatures):
+        for band in range(num_bands):
+            start = band * rows
+            key = (
+                band,
+                signature[start:start + rows].tobytes(),
+            )
+            for previous in buckets[key]:
+                candidates.add((previous, doc_index))
+            buckets[key].append(doc_index)
+    return candidates
+~~~
+
+LSH collision 只是候选信号，之后必须算真实规范化 n-gram Jaccard。A≈B、B≈C 时用 union-find 合成同一簇。课程允许随机保留一个；示例为可复现性按排序路径保留每簇第一个。完整实现见 [deduplication.py](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment4/cs336_data/deduplication.py)。
+
+<CheckpointQuiz
+  question="两篇文档在一个 LSH band 中完全相同，下一步应该做什么？"
+  options={['直接删一篇', '作为候选，再算真实 n-gram Jaccard', '只比较原始文件字节']}
+  answer={1}
+  explanation="band collision 只负责高召回候选；真实相似度阈值控制误删，并查集再处理传递关系。"
+/>
+
+## 10. 组合成可审计的并行流水线
+
+### 10.1 推荐顺序不是随意排列
+
+| 顺序 | 操作 | 原因 |
+|---:|---|---|
+| 1 | 可选目标域 + language | 便宜，先减少后续模型调用 |
+| 2 | Gopher rules | 纯 CPU 规则，快速丢明显异常 |
+| 3 | NSFW / toxic | 对剩余文本跑两份模型 |
+| 4 | learned quality | 阈值需要目标域校准 |
+| 5 | PII mask | 处理最终保留文本并记录替换数 |
+| 6 | exact line dedup | 必须观察完整过滤后 corpus |
+| 7 | MinHash document dedup | 在缩小语料上做签名与聚类 |
+| 8 | tokenize | 最后支付 tokenizer 与二进制 I/O |
+
+若隐私威胁模型要求“任何落盘文本都先去 PII”，PII 应前移；关键是明确政策和顺序，而不是死背表格。
+
+单文档决策函数：
+
+~~~python
+def process(self, text, url=""):
+    if self.config.target_domains and not host_matches(
+        url, self.config.target_domains
+    ):
+        return None, "domain"
+
+    language, score = self.language_identifier(text)
+    if language != "en" or score < self.config.english_threshold:
+        return None, "language"
+
+    if not passes_gopher_quality_filter(text):
+        return None, "gopher"
+
+    label, score = self.nsfw_classifier(text)
+    if label == "nsfw" and score >= self.config.nsfw_threshold:
+        return None, "nsfw"
+
+    label, score = self.toxicity_classifier(text)
+    if label == "toxic" and score >= self.config.toxicity_threshold:
+        return None, "toxic"
+
+    label, score = self.quality_classifier(text)
+    if label != "wiki" or score < self.config.quality_threshold:
+        return None, "learned_quality"
+
+    text, emails = mask_emails(text)
+    text, phones = mask_phone_numbers(text)
+    text, ips = mask_ipv4_addresses(text)
+    return text, f"kept:email={emails},phone={phones},ip={ips}"
+~~~
+
+### 10.2 每个 worker 只加载一次模型
+
+两份 Dolma 权重很大，绝不能每篇文档重新 load。示例的 <code>PipelineFactory</code> 是可 pickle 的顶层 dataclass；每个 process 启动后加载四个模型一次，此后按 WET 文件复用。按文件分任务也避免在进程间传递巨型文档。
+
+每个 worker 返回：
+
+- <code>seen</code>、<code>kept</code> 与各 drop reason；
+- email/phone/IP 替换数；
+- 输入 bytes 与 elapsed time；
+- 每种 decision 的可复现审计样本。
+
+主进程输出：
+
+~~~text
+filtered/
+  *.warc.wet.gz.jsonl
+  filter-stats.json
+  audit-samples.jsonl
+~~~
+
+审计抽样按 decision、URL、snippet 的 BLAKE2b key 确定性选取，不使用无 seed 的 random。运行完整代码：
+
+~~~bash
+python -m cs336_data.cli filter \
+  --input "/shared-data/english-wet-data/*.warc.wet.gz" \
+  --output-directory data/filtered \
+  --lid-model models/lid.176.bin \
+  --nsfw-model models/dolma-nsfw.bin \
+  --toxicity-model models/dolma-toxic.bin \
+  --quality-model models/quality.bin \
+  --workers 32 \
+  --audit-per-reason 5
+~~~
+
+若做 C4 100 domains 的高 precision 实验，可把验证 metadata 中的域名另存文本，加 <code>--target-domains c4-100-domains.txt</code>。只可使用 domain 或统计信号，禁止把 Paloma 验证文本写入训练 JSONL。
+
+### 10.3 统计怎样解释
+
+按顺序短路时：
+
+$$
+\text{drop fraction}_i =
+\frac{\text{first removed by filter }i}{\text{seen}}.
+$$
+
+这是 first-hit 计数。同一文档若同时 low-quality 和 toxic，只归到先执行者。研究过滤器重叠时要另跑 shadow evaluation：全部打标签但暂不删除。
+
+<code>filter-stats.json</code> 保存 wall seconds、worker seconds、input bytes 和 bytes/s。全 dump 粗估：
+
+$$
+T_{\text{full}}\approx
+\frac{\text{full dump bytes}}{\text{measured bytes per second}}.
+$$
+
+报告机器、worker 数、存储介质、是否排除下载时间，以及小样本外推假设；不能把冷启动吞吐伪装成稳态吞吐。
+
+## 11. 检查保留与丢弃样本
+
+从 <code>audit-samples.jsonl</code> 分别选五条 kept 和五条修改/删除记录。每条回答：
+
+1. 页面类型与核心内容；
+2. 哪个规则作出决定，触发条件或 score；
+3. 对 C4 100 domains 是否合适；
+4. 决定是否正确，下一版改什么。
+
+网站不会替你捏造共享数据上的数字；完整脚本会产出提交所需证据。一个合格迭代描述应像：“登录页经常通过 learned quality；新增正文/boilerplate 规则后，在固定审计样本上误留下降，同时固定 token 小训练的 validation loss 没有恶化。”最终数字必须来自自己的 audit 与日志。
+
+## 12. tokenize：流式写 uint16，文档间加 EOS
+
+GPT-2 vocabulary 小于 65,536，token ID 可保存为 <code>np.uint16</code>。每篇末尾必须加 <code>&lt;|endoftext|&gt;</code>，否则网页 A 尾部与网页 B 开头会被误当成同一文档。
+
+课程 starter 把所有 token 放进列表，大数据会耗尽内存。可运行实现按文档立即写：
+
+~~~python
+ENCODING = None
+
+def initialize_worker():
+    global ENCODING
+    ENCODING = tiktoken.get_encoding("gpt2")
+
+def encode_document(text):
+    if ENCODING is None:
+        initialize_worker()
+    return ENCODING.encode_ordinary(text) + [ENCODING.eot_token]
+
+def tokenize_jsonl(input_paths, output_path, workers=None, chunksize=100):
+    token_count = 0
+    with (
+        Path(output_path).open("wb") as output,
+        multiprocessing.Pool(
+            workers or multiprocessing.cpu_count(),
+            initializer=initialize_worker,
+        ) as pool,
+    ):
+        for token_ids in pool.imap(
+            encode_document,
+            iter_jsonl_text(input_paths),
+            chunksize=chunksize,
+        ):
+            array = np.asarray(token_ids, dtype=np.uint16)
+            array.tofile(output)
+            token_count += len(array)
+    return token_count
+~~~
+
+~~~bash
+python -m cs336_data.cli tokenize \
+  --input "data/deduplicated/*.jsonl" \
+  --output data/train.bin \
+  --workers 32
+~~~
+
+完成后检查：
+
+~~~python
+ids = np.fromfile("data/train.bin", dtype=np.uint16)
+assert len(ids) == reported_token_count
+assert ids.max() < 50257
+print(tokenizer.decode(ids[:2000]))
+~~~
+
+EOS 数应大致等于文档数。若解码出现大量 JSON 的 URL/key，说明错误地编码了整个 object，而不是 <code>record["text"]</code>。
+
+## 13. 固定训练配方，比较的只能是数据
+
+题面固定约 430M 参数、8 张 B200、每设备 batch 128、context 512、16,384 steps，约 2 小时。处理 token：
+
+$$
+8\times128\times512\times16384
+=8{,}589{,}934{,}592
+\approx8.6\text{B}.
+$$
+
+~~~bash
+uv run modal run scripts/train.py \
+  --train-bin /root/data/train.bin
+~~~
+
+每次实验记录：
+
+| data version | filters/thresholds | unique tokens | best val loss | step | val PPL | notes |
+|---|---|---:|---:|---:|---:|---|
+| v1 | … | … | … | … | exp(loss) | … |
+
+不要修改 architecture、optimizer 或训练过程来提分，否则无法归因于数据。若文件小于 8.6B unique tokens，loader 可能重复采样；应同时报告 unique token 与 sampled token。
+
+<AssignmentStepper items={[
+  '完成 25 条 WARC/WET 结构化标注',
+  '编码 fallback 与 Resiliparse 抽取测试通过',
+  '真实 lid.176 权重返回 en/zh 与正置信度',
+  'PII 保留句末标点并返回准确次数',
+  'NSFW/toxic 完整标签匹配并分别校准',
+  '四条 Gopher 边界条件都有测试',
+  '质量分类器按 domain 切分并画 PR curve',
+  '精确行全局两遍，LSH 候选再算真实 Jaccard',
+  '每个过滤原因有计数、耗时与审计样本',
+  'uint16 文件在每个文档后加入 GPT-2 EOS',
+  '固定官方训练配方并记录最佳 loss 与曲线'
+]} />
+
+## 14. 官方测试与故障定位
+
+~~~bash
+uv run pytest -k test_extract_text_from_html_bytes
+uv run pytest -k test_identify_language
+uv run pytest -k test_mask
+uv run pytest -k test_classify_nsfw
+uv run pytest -k test_classify_toxic_speech
+uv run pytest -k test_gopher
+uv run pytest -k test_classify_quality
+uv run pytest -k test_exact_line_deduplication
+uv run pytest -k test_minhash_deduplication
+~~~
+
+| 现象 | 优先检查 |
 |---|---|
-| `run_extract_text_from_html_bytes` | HTML bytes → 正文字符串；与固定抽取文本逐字一致 |
-| `run_identify_language` | text → `(language, positive_score)`；至少正确映射英文和简中 |
-| `run_mask_emails` | text → `(masked_text, count)`；已有 mask 不重复计数 |
-| `run_mask_phone_numbers` | 覆盖题面四种美国电话格式，同时分析误报 |
-| `run_mask_ips` | 合法 IPv4 mask，octet 范围不能只靠 `\d+` |
-| `run_classify_nsfw` | text → `nsfw/non-nsfw` 与 score |
-| `run_classify_toxic_speech` | text → `toxic/non-toxic` 与 score |
-| `run_classify_quality` | text → `wiki/cc` 与 score；注意负采样域泄漏 |
-| `run_gopher_quality_filter` | text → bool；严格实现四条必做规则 |
-| `run_exact_line_deduplication` | input dir → output dir；全局两遍、保留同名文件 |
-| `run_minhash_deduplication` | 文档目录 → 去重目录；规范化、LSH 候选、相似度验证、簇 |
-
-每个 adapter 对应一个可以单测的纯函数边界；完整流水线再负责顺序、批处理、统计和审计样本。
-
-证据入口：[A4 仓库](https://github.com/stanford-cs336/assignment4-data)、[`wet_files.py`](https://github.com/stanford-cs336/assignment4-data/blob/main/cs336_data/wet_files.py)、[Common Crawl 格式](https://commoncrawl.org/blog/navigating-the-warc-file-format)、[Resiliparse](https://resiliparse.chatnoir.eu/en/stable/)。
+| 语言返回 <code>__label__zh</code> | 去前缀并做 alias |
+| <code>non-nsfw</code> 被判正类 | 禁止 substring，完整标签匹配 |
+| 句末邮箱/IP 没替换 | 右边界不能排斥普通句末标点 |
+| 30% ellipsis 被拒绝 | 题面是 more than 30% |
+| 输出少文件 | 内容全删也要创建同名输出 |
+| fuzzy duplicate 漏掉 | 检查 NFD、去 accents/标点/空白、seed |
+| LSH 误删多 | collision 后是否算真实 Jaccard |
+| Windows multiprocessing 报 pickle | factory 是否顶层、可 pickle |
+| PPL 上升 | 域偏离、过滤过窄、误删、多样性与 token 数 |
 
 <Accordions>
-  <Accordion title="MinHash 结果每次不同">检查是否固定 hash family/seed、是否用了 Python 内置 hash、输入规范化与文件遍历顺序是否稳定。</Accordion>
-  <Accordion title="质量上升但验证 PPL 变差">检查过滤是否过窄、数据域是否偏离验证集、去重是否误删、多样性/token 数是否变化；“更像 Wikipedia”不等于所有目标都更好。</Accordion>
+  <Accordion title="为什么不把两份近 1 GB 的 Dolma 模型放进 Git？">它们是课程链接可复现的外部资产。提交大二进制会膨胀 clone、Pages build 和历史；代码从命令行路径加载并在启动时检查。</Accordion>
+  <Accordion title="fastText score 是绝对概率吗？">不能默认跨域校准。它适合排序和候选阈值，但必须在目标 holdout 画 PR/reliability 并人工审计边界。</Accordion>
+  <Accordion title="先去重还是先过滤？">便宜过滤先做可减少 MinHash 成本；模板行去重有时也改善质量信号。应固定顺序、报告 first-hit，并用消融验证。</Accordion>
 </Accordions>
+
+## 15. 必读资料与源码地图
+
+- [A4 原仓库](https://github.com/stanford-cs336/assignment4-data)：starter、tests、训练脚本、adapters。
+- [Common Crawl](https://commoncrawl.org/)：WARC/WAT/WET 数据入口。
+- [FastWARC](https://resiliparse.chatnoir.eu/en/stable/man/fastwarc.html) 与 [Resiliparse](https://resiliparse.chatnoir.eu/en/stable/)：record、编码和正文抽取。
+- [fastText language ID](https://fasttext.cc/docs/en/language-identification)：176 语言模型。
+- [Dolma 仓库](https://github.com/allenai/dolma) 与 [论文](https://arxiv.org/abs/2402.00159)：过滤、tagging、去重。
+- [Gopher](https://arxiv.org/abs/2112.11446) Appendix A：质量规则。
+- [Mining of Massive Datasets 第 3 章](http://infolab.stanford.edu/~ullman/mmds/ch3n.pdf)：MinHash/LSH 证明。
+- [RefinedWeb](https://arxiv.org/abs/2306.01116)、[Paloma](https://arxiv.org/abs/2312.10523)、[C4/T5](https://www.jmlr.org/papers/v21/20-074.html)。
+
+| 文件 | 负责内容 |
+|---|---|
+| [extraction.py](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment4/cs336_data/extraction.py) | 编码 fallback、正文抽取 |
+| [classifiers.py](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment4/cs336_data/classifiers.py) | fastText、语言 alias、显式二分类标签 |
+| [pii.py](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment4/cs336_data/pii.py) | 三类 PII |
+| [quality.py](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment4/cs336_data/quality.py) | Gopher 与质量模型 |
+| [deduplication.py](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment4/cs336_data/deduplication.py) | 精确行、MinHash、LSH、并查集 |
+| [pipeline.py](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment4/cs336_data/pipeline.py) | worker、WET、统计、计时、审计 |
+| [tokenize.py](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment4/cs336_data/tokenize.py) | GPT-2、EOS、流式 uint16 |
+| [cli.py](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment4/cs336_data/cli.py) | 质量训练、过滤、tokenize 命令 |
+
+---
+
+## 题面中文全文（按原页顺序）
+
+以下保留原题章节、问题、交付物、路径、数值和限制的顺序，便于与 PDF 逐项对照。
+
+### 第 1 页：作业概览
+
+**CS336 作业 4（数据）：过滤语言模型数据**
+版本 26.0.1，CS336 教学团队，2026 年春季。
+
+本作业会让你亲手过滤网页抓取数据，为语言模型创建数据。
+
+你将实现：
+
+1. 把 Common Crawl HTML 转成文本；
+2. 用有害内容、个人可识别信息等多种方法过滤抽取文本；
+3. 对训练数据去重。
+
+你将运行：
+
+1. 在不同数据集上训练语言模型，以理解具体处理决策对性能的影响。
+
+全部代码和题面位于 [Stanford CS336 Assignment 4 仓库](https://github.com/stanford-cs336/assignment4-data)。请 clone；若有更新，教学团队会通知并可 git pull。
+
+目录说明：
+
+1. <code>cs336_basics/*</code> 是训练 A1 模型的代码。它以 PyTorch 原生组件替换部分手写组件，例如内置 cross-entropy kernel，并提供支持多 GPU DDP 的训练脚本；本作业用它训练过滤数据。
+2. <code>cs336_data/*</code> 是 A4 实现位置，starter 已有占位。
+3. <code>tests/*.py</code> 是必须通过的测试，通过 <code>tests/adapters.py</code> hooks 调用代码。可新增测试或临时改测试调试，但最终必须通过原测试套件。
+4. <code>README.md</code> 说明目录结构和环境。
+
+Gradescope 提交 <code>writeup.pdf</code>（排版后的全部书面答案）与 <code>code.zip</code>（全部代码）。
+
+### 第 2 页：过滤 Common Crawl
+
+大型语言模型主要在互联网数据上训练，但多数研究者不自行造 crawler，而使用公开抓取。最常见的是 Common Crawl：非营利组织免费提供网页语料，覆盖 17 年、超过 2500 亿页面。
+
+把 CC dump 变成可用训练数据需要大量工作。原始网页是 HTML，需要抽文本；许多页面低质、完全或近似重复、含有害内容或敏感信息，需要删页或移除部分内容。本作业建立包含这些步骤的流水线。
+
+实现前先观察原始数据。CC 有三种格式：
+
+- **WARC（Web ARChive）**：原始 CC 数据，包括页面 ID/URL、metadata、HTTP request 细节（时间、服务器 IP 等）和网页原始内容。
+- **WAT（Web Archive Transformation）**：从 WARC 抽出的高层 JSON metadata；HTML 可含页面 links 和 title。
+- **WET（Web Extracted Text）**：从 HTML 抽取的纯文本。
+
+题目使用 2026 Common Crawl 的 WARC/WET 样例，PDF 给出 <code>CC-MAIN-2026-12</code> 两个下载 URL；共享路径：
+
+- <code>/shared-data/CC/example.warc.gz</code>
+- <code>/shared-data/CC/example.warc.wet.gz</code>
+
+警告：文件完全未过滤，可能有大量有害内容；遇到不愿阅读的文档可直接跳过。
+
+**问题 look_at_cc（4 分）**
+
+（a）用 <code>zcat /shared-data/CC/example.warc.gz | less</code> 查看第一条。less 用方向键/Page Up/Page Down，按 q 退出。回答 URL、现在能否访问、从 HTML 能否判断主题。交付 2–3 句。
+
+（b）用 <code>zcat /shared-data/CC/example.warc.wet.gz | less</code> 看 WET。Content-Length 等 headers 不是正文。比较第一条抽取文本与 HTML：哪些结构残留应过滤？用于训练可能出什么问题？又可能提供什么信息？交付 3–4 句。
+
+（c）好样本取决于上下文。描述一个该页面有用的应用域与一个不适合的应用域。交付 1–2 句。
+
+（d）再看 25 条 WET record；简记语言、domain、页面类型等。第几条出现你认为高质量的页面？交付 25 条标注及首次高质量样本位置。
+
+### 第 3–4 页：HTML 转文本
+
+HTML 抽文本很难。典型方法寻找可见内容，例如 <code>&lt;p&gt;</code>，但仍可能抽出浏览器可见、却非主内容的菜单和页脚。Stack Overflow 的核心是问答，但菜单、其他站点链接、注册/登录也都可见，很难可靠区分。
+
+本作业用 Resiliparse。它还检测原始 bytes 的编码。虽然绝大多数 Web 页面是 UTF-8，流水线仍应兼容其他编码。建议用 FastWARC 的 <code>ArchiveIterator</code> 与 <code>WarcRecordType</code> 遍历。
+
+**问题 extract_text（3 分）**
+
+（a）函数从原始 HTML bytes 抽文本。用 <code>extract_plain_text</code>；先把 bytes 解码成 Unicode，若 UTF-8 失败则检测编码，可用 <code>detect_encoding()</code>。交付 bytes → 字符串函数，实现 <code>run_extract_text_from_html_bytes</code>，通过对应 pytest。
+
+（b）在单个 WARC 上运行，与对应 WET 比较异同和哪种更好。交付 2–3 句。
+
+### 第 4 页：语言识别
+
+Web 有数千种语言。多数 compute budget 下难以让多语言模型有效利用如此多语言，所以许多 CC 派生训练集只保留有限语言。
+
+fastText 提供高效文本分类器、训练设施和预训练模型。<code>lid.176.bin</code> 可从 fastText 官方页下载，也位于 <code>/shared-data/classifiers/lid.176.bin</code>。语言过滤器通常依据 classifier score 保留页面；实现应返回预测置信度的非负分数。
+
+**问题 language_identification（6 分）**
+
+（a）接收 Unicode 字符串，返回主要语言 identifier 与 0–1 confidence。实现 <code>run_identify_language</code>，通过两个测试；测试规定英语 <code>en</code>、中文 <code>zh</code>，必要时在 adapter 重映射。
+
+（b）训练数据过滤问题会怎样影响下游推理？高风险用户产品如何缓解？交付 2–5 句。
+
+（c）在 WARC 抽取文本上运行，人工标 20 个随机样本并比较；报告错误、英语比例和合适阈值。交付 2–5 句。
+
+### 第 5–6 页：个人可识别信息
+
+Web 有大量可联系或识别个人的信息，如邮箱、电话、IP。面向用户的模型可能不应输出真实个人信息，常见步骤是在训练集中掩码。
+
+**问题 mask_pii（3 分）**
+
+（a）把所有邮箱替换为 <code>|||EMAIL_ADDRESS|||</code>，返回新字符串与替换次数。实现 <code>run_mask_emails</code>，通过所有邮箱测试。
+
+（b）把电话替换为 <code>|||PHONE_NUMBER|||</code>，返回文本与次数。可靠识别很难，至少覆盖美国常见格式并容忍轻微变化。实现 <code>run_mask_phone_numbers</code>，通过电话测试。
+
+（c）处理 IPv4，即四个由点分隔、各不超过 255 的数字；替换为 <code>|||IP_ADDRESS|||</code>，返回文本与次数。实现 <code>run_mask_ips</code>，通过 IP 测试。
+
+（d）朴素应用这些过滤器会产生什么下游问题？如何缓解？交付 2–5 句。
+
+（e）在 WARC 抽取文本上运行 PII mask，查看 20 个发生替换的随机样本，给出 false positives 与 false negatives。交付 2–5 句。
+
+### 第 6–7 页：有害内容
+
+未过滤 Web dump 含大量不希望模型复现的文本，甚至一般安全网站的用户评论也可能有害。虽然 harmful 很难划出清晰边界，数据流水线仍常过滤主要由有害内容组成的页面。
+
+方法包括 ban list 或人类标签训练的分类器。本作业处理 NSFW（色情、亵渎或其他令人不适内容）与 toxic speech（粗鲁、不尊重或不合理，可能让人退出讨论的语言）。使用 Dolma 提供、在 Jigsaw Toxic Comments 的 Wikipedia 评论上训练的 fastText 模型。
+
+共享模型：
+
+- <code>/shared-data/classifiers/dolma_fasttext_hatespeech_jigsaw_model.bin</code>：hate/toxic；
+- <code>/shared-data/classifiers/dolma_fasttext_nsfw_jigsaw_model.bin</code>：NSFW。
+
+函数接收页面 Unicode，返回标签（例如 toxic/non-toxic）和 confidence。
+
+**问题 harmful_content（6 分）**
+
+（a）实现 NSFW 检测，返回标签与分数，接入 <code>run_classify_nsfw</code> 并通过测试。Jigsaw 测试只是 sanity check，绝不证明总体准确，必须自行验证。
+
+（b）实现 toxic speech 检测，返回标签与分数，接入 <code>run_classify_toxic_speech</code> 并通过测试；同样只是 sanity check。
+
+（c）这些过滤器构建训练集会造成哪些下游问题？怎样缓解？交付 2–5 句。
+
+（d）在 WARC 抽取文本上运行，人工检查 20 个随机案例；报告分类错误、有害比例和适合的两个 confidence thresholds。交付 2–5 句。
+
+### 第 7–8 页：质量规则
+
+语言和 harmful 过滤后仍有许多低质页面：paywall、坏链占位、登录/注册/联系表单、主要是图片视频而抽不出正文的页面。
+
+Gopher 给出易理解的启发式规则。题面要求删除：少于 50 或多于 100,000 words；平均 word 长度不在 3–10；超过 30% 行以省略号结尾；少于 80% words 含至少一个字母。完整规则见 Gopher Appendix A。
+
+**问题 gopher_quality_filters（3 分）**
+
+（a）至少实现上述子集。可用 NLTK <code>word_tokenize</code>，但不强制。函数接收字符串、返回 bool，实现 adapter 并通过 <code>test_gopher</code>。
+
+（b）在 WARC 抽取文本上运行，人工看 20 个随机案例，评论规则与人工判断不一致之处。交付 2–5 句。
+
+### 第 8–9 页：质量分类器
+
+质量排序不只用于语言模型，信息检索也长期使用。经典信号是链接结构：高质页面倾向链接高质页面。GPT-2 的 WebText 收集 Reddit 达到 karma 阈值的评论链接；另一选择是 Wikipedia 外链，因为其外部来源通常更可信。
+
+受控来源质量较高但规模小；OpenWebText 约 40 GB，而 The Pile 大 20 倍以上。可用 Wikipedia reference pages 为正例、随机 CC 为负例训练 fastText，再以 quality score 过滤 CC；阈值权衡 precision 与 recall。
+
+共享目录的 <code>/shared-data/wiki/enwiki-20260501-extracted_urls.txt.gz</code> 是 2026-05-01 英文 Wikipedia 外链，应子采样为正例。这些页面仍可能含不良内容，可先应用语言与规则等 primitives。给 URL 列表后可用题面的 wget 命令抓为 WARC。
+
+**问题 quality_classifier（15 分）**
+
+（a）训练输入文本、返回数值质量 score 的 classifier。交付该模型。
+
+（b）函数把页面标为高/低质量并返回 confidence；实现 <code>run_classify_quality</code>，通过两个 sanity examples。
+
+### 第 9 页：精确行去重
+
+Web 有大量重复：完全相同页面、404 模板，以及 Stack Overflow 等页面间重复的 header/menu/footer。只保留全语料唯一行可消除许多模板重复，并可能留下问答等主内容。
+
+第一遍统计每行频率，第二遍重写文档、仅保留唯一行。朴素 counter 的 key 可能与全部独特行原文一样占空间；固定大小行 hash 可降低内存。
+
+**问题 exact_deduplication（3 分）**
+
+函数输入路径列表和输出目录，先以 hash 统计全语料行频率，再把每个输入以同名写到输出目录，只保留输入集合中出现一次的行。例如输入 <code>a/1.txt</code>、<code>a/2.txt</code>，输出目录 <code>b/</code>，应产生 <code>b/1.txt</code>、<code>b/2.txt</code>。实现 adapter，通过精确去重测试。
+
+### 第 10–12 页：MinHash + LSH 文档去重
+
+精确方法无法处理只改年份、作者或空白的模板文档，因此模糊文档级去重使用 MinHash 与 LSH。
+
+文档表示为 n-gram 集合，集合 $S,T$ 的 Jaccard 是 $|S\cap T|/|S\cup T|$。全量两两计算是二次复杂度，存所有 n-gram 集合也耗内存。
+
+MinHash 使用 $k$ 个不同 hash 函数。对集合 $S=\{s_1,\ldots,s_n\}$，第 $i$ 维为 $\min(h_i(s_1),\ldots,h_i(s_n))$。两个集合的 Jaccard 可由签名相同维度比例近似；例如 [1,2,3,2] 与 [5,2,3,4] 有 2/4 维相同。
+
+LSH 避免仍比较全部签名对。把 $k$ 维分为 $b$ bands、每 band $r$ 行，$k=br$。任一 band 全同就进同 bucket，成为 candidate duplicate。固定签名长度时，更多 bands 提高 recall、降低 precision。题面的两个六维签名用 3×2 切分，第一 band [1,2] 相同，因此成为候选，其他 bands 不匹配也不取消候选。
+
+候选可再算真实 Jaccard，超过阈值才判重复。重复关系还要跨 bucket 聚类：A-B 与 B-C 通过时，即使 A-C 未直接配对，也组成 A/B/C 簇，最终每簇保留一篇。
+
+**问题 minhash_deduplication（8 分）**
+
+函数至少输入：文件路径列表、MinHash 数、LSH bands 数、word n-gram 长度、Jaccard threshold 和输出目录。可假设 hash 数能被 band 数整除。为提高 recall，按 RefinedWeb 做 lowercase、去标点、统一空白、去 accents、Unicode NFD。
+
+输出只写非候选/未达阈值文档，以及每个重复簇选中的一篇，并保留原文件名。实现 <code>run_minhash_deduplication</code>，通过测试。
+
+### 第 12–13 页：为语言模型过滤数据
+
+现在组合 primitives 生成训练数据。起点是 <code>/shared-data/english-wet-data</code> 中 2,500 个英语 WET；这些文档已经由 <code>lid.176.bin</code> 以英语概率至少 70% 过滤。
+
+目标是让过滤数据训练出的 Transformer 在 Paloma 的 C4 100 domains 子集上获得最低 validation perplexity。不能修改 architecture 或训练过程，因为比较对象是数据。共享验证文件 <code>/shared-data/tokenized_paloma_c4_100_domains_validation.bin</code> 已用 GPT-2 tokenizer 编码，可用 <code>np.fromfile(..., dtype=np.uint16)</code> 加载并解码观察。
+
+允许用 Paloma validation 构造过滤器或 classifier，但严禁把任何验证数据逐字复制进训练集；模型绝不能见到验证文本。
+
+WET 规模很大，应使用 <code>concurrent.futures</code> 或 <code>multiprocessing</code>；Modal 可用 <code>.map(...)</code>。题面给出 ProcessPoolExecutor 示例，并建议 FastWARC 遍历 record、tldextract 提取 domain。
+
+**问题 filter_data（6 分）**
+
+（a）编写脚本，并行过滤共享英语 WET。可用此前 primitives，也可探索 n-gram LM perplexity 等其他方法。目标是最小化 C4 100 validation perplexity；脚本要报告每个 filter 保留/删除例数。交付并行脚本或脚本序列，以及各步骤丢弃比例。
+
+（b）过滤 2,500 个原始 WET 用时多久？完整 Common Crawl 估计多久？交付 runtime。
+
+### 第 13–14 页：检查过滤数据
+
+**问题 inspect_filtered_data（4 分）**
+
+（a）从最终数据随机取五条，评论质量和是否适合语言模型，特别考虑 C4 100 domains 目标。长文只需相关摘录，每条 1–2 句。
+
+（b）取五条被删除或修改的原始 WET；说明哪个步骤处理、是否合理。长文可截取，每条 1–2 句。
+
+（c）若分析促使你修改流水线，可在训练前修改，并报告尝试的数据版本与变化。
+
+### 第 14–15 页：tokenize
+
+使用 GPT-2 tokenizer 把过滤数据编码为整数 ID，每篇后加入 <code>&lt;|endoftext|&gt;</code>。starter 用 multiprocessing 编码、flatten，转 <code>np.uint16</code> 后通过 <code>ids_array.tofile(output_path)</code> 写文件。
+
+**问题 tokenize_data（2 分）**
+
+编写 tokenize/序列化脚本；必须使用与 starter 兼容的 uint16 <code>tofile</code> 格式。报告过滤数据总 token 数。
+
+### 第 15–16 页：训练模型
+
+训练约 430M 参数、GPT-2 small shape 的模型；8 张 B200、数据并行、每设备 batch 128、16,384 steps、context 512，共约 8.6B sampled tokens，参考运行约 2 小时。
+
+使用 <code>scripts/train.py</code>，超参在 <code>cs336_basics/train_config.py</code>，传入：
+
+~~~bash
+uv run modal run scripts/train.py --train-bin /root/data/your_data.bin
+~~~
+
+可用 <code>scripts/generate_with_gpt2_tok.py --model-path ...</code> 从 checkpoint 采样。目标是通过数据最小化 validation loss，不得修改模型或优化过程。
+
+**问题 train_model（8 分）**
+
+在 tokenized 数据上训练约 430M 模型，周期性测 C4 100 domains validation loss。报告最佳 loss、对应 learning curve，以及完成的数据处理与实验说明。
+
+### 参考文献
+
+1. Soldaini 等，**Dolma：用于语言模型预训练的三万亿 token 开放语料库**，arXiv:2402.00159，2024。
+2. Rae 等，**扩展语言模型：Gopher 的方法、分析与训练洞见**，arXiv:2112.11446，2021。
+3. Page、Brin、Motwani、Winograd，**PageRank 引文排序：为 Web 带来秩序**，WWW，1998。
+4. Radford 等，**语言模型是无监督多任务学习器**，OpenAI，2019。
+5. Touvron 等，**LLaMA：开放且高效的基础语言模型**，2023。
+6. Leskovec、Rajaraman、Ullman，**Mining of Massive Datasets**，第二版，Cambridge University Press，2014。
+7. Penedo 等，**RefinedWeb：仅用 Web 数据胜过 curated corpora**，2023。
+8. Magnusson 等，**Paloma：评估语言模型分布拟合的基准**，2023。
+9. Raffel 等，**用统一文本到文本 Transformer 探索迁移学习极限**，JMLR 21(140)，2020。

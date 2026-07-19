@@ -1,7 +1,7 @@
 import defaultMdxComponents from 'fumadocs-ui/mdx';
 import * as TabsComponents from 'fumadocs-ui/components/tabs';
 import * as AccordionComponents from 'fumadocs-ui/components/accordion';
-import { AssignmentStepper, CheckpointQuiz, ScalingLab, TensorShapeLab } from './learning-labs';
+import { AdvantageNormalizerLab, AssignmentStepper, CheckpointQuiz, ExecutionTrace, ImportanceClipLab, ScalingLab, TensorShapeLab, TermDeck } from './learning-labs';
 import type { MDXComponents } from 'mdx/types';
 
 export function getMDXComponents(components?: MDXComponents) {
@@ -10,9 +10,13 @@ export function getMDXComponents(components?: MDXComponents) {
     ...TabsComponents,
     ...AccordionComponents,
     AssignmentStepper,
+    AdvantageNormalizerLab,
     CheckpointQuiz,
+    ExecutionTrace,
+    ImportanceClipLab,
     ScalingLab,
     TensorShapeLab,
+    TermDeck,
     ...components,
   } satisfies MDXComponents;
 }

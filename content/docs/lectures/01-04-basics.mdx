@@ -3,75 +3,673 @@ title: Lectures 1–4 · 基础与架构
 description: 从课程资源观、tokenization 与 FLOP 核算，到现代 Transformer、长上下文和 MoE。
 ---
 
-## Lecture 1：课程不是组件清单，而是资源优化
+## Lecture 1：从课程全景走到 BPE
 
-CS336 从“固定资源下最大化模型质量”统一五次作业。字节 tokenizer 完备却拉长序列；BPE 用词表内存换更短 T。GQA/滑窗减少 KV 与 attention 成本；数据过滤避免把计算浪费在垃圾上；缩放律用便宜小实验替代盲目大训练；RL 系统还要在吞吐与 on-policy 新鲜度间取舍。
+这讲解决两个问题：为什么要“从零”建语言模型，以及原始字符串怎样变成模型真正处理的整数。贯穿全课的目标不是堆叠最新组件，而是在数据、计算、显存和通信预算固定时，让模型质量尽可能高。
 
-### 从字符串到 BPE
+<TermDeck
+  title="第一讲的高频缩写"
+  items={[
+    { term: 'BPE', expansion: 'Byte Pair Encoding', chinese: '字节对编码', explanation: '从字节词表出发，反复合并训练语料中最常见的相邻 token 对；得到的 merge 顺序同时定义了编码算法。', example: 't h e → th e → the' },
+    { term: 'HBM', expansion: 'High Bandwidth Memory', chinese: '高带宽显存', explanation: 'GPU 旁边保存参数、激活与优化器状态的内存。算力再高，如果数据来不及从 HBM 搬到计算单元，模型仍会慢。' },
+    { term: 'SFT', expansion: 'Supervised Fine-Tuning', chinese: '监督微调', explanation: '用高质量“指令—回答”对继续做下一 token 训练，让基础模型更稳定地遵循指令。' },
+    { term: 'RLHF', expansion: 'Reinforcement Learning from Human Feedback', chinese: '从人类反馈进行强化学习', explanation: '让模型生成候选回答，以人类偏好或其代理评分，再更新策略偏好高分回答。' },
+    { term: 'GQA', expansion: 'Grouped-Query Attention', chinese: '分组查询注意力', explanation: '多个 query 头共享较少的 key/value 头，以少量质量折中换取更小的 KV cache。' },
+  ]}
+/>
 
-Python `str` 表示 Unicode code point，`.encode('utf-8')` 才得到 bytes。单纯字符词表对不同书写系统不公平，单词词表永远遇到新词，256 字节词表则对任意文件完备。BPE 的目标不是语言学分词，而是学习一个可逆的压缩词典。
+### 1. 为什么抽象层仍然会“漏”
 
-训练步骤可写成带权多重集合：预分词结果 `w` 有频次 `f(w)`；pair `(u,v)` 的总计数是它在每个 w 中的非重叠出现次数乘 `f(w)`。每轮选定 pair、生成 `uv`、更新词表与 merge rank。编码阶段必须按训练优先级重放 merge，而不是“见到词表中最长串就贪心”。
+研究工作经历了明显上移：早期研究者亲自实现并训练模型，随后下载 BERT 一类模型微调，如今常常只向 GPT、Claude 或 Gemini API 发提示。抽象提高生产力，但语言模型的抽象仍是 **leaky abstraction（有泄漏的抽象）**：分词方式会改变上下文长度，数值精度会改变稳定性，batch 与通信拓扑会改变可训练规模，数据去重会改变记忆与评测污染。要研究这些根因，就必须能拆开整条栈。
 
-压缩率常用 `bytes/token`。高压缩让同样 context window 覆盖更多原文，也减少每样本 attention/MLP 计算；但词表过大会增大 embedding/lm-head 参数与 softmax 成本，并让稀有 token 学不充分。
+课程把可迁移知识分成三层：
+
+1. **Mechanics（机制）**：Transformer、模型并行、BPE 到底如何工作；
+2. **Mindset（方法）**：认真核算规模，持续挤出硬件效率；
+3. **Intuition（经验直觉）**：哪些数据或架构选择更可能改善准确率。
+
+前两层能较可靠地从小模型迁移到前沿模型；第三层会随规模、数据和硬件改变，必须靠实验重新验证。“苦涩的教训”也不是“算法无用、只要扩大规模”，而是：**真正重要的是能随资源一起扩展的算法**。课程用一个乘法式表达这种关系：
+
+$$
+\text{accuracy} \approx \text{algorithmic efficiency} \times \text{resources}.
+$$
+
+### 2. 一张课程地图：五次作业在优化什么
+
+| 单元 | 你控制的变量 | 主要瓶颈 | 对应作业 |
+| --- | --- | --- | --- |
+| Basics | tokenizer、架构、优化器、schedule | 表达力 / 稳定性 / 单步成本 | A1 |
+| Systems | kernel、切分方式、推理解码 | HBM 搬运 / 通信 / 空泡 | A2 |
+| Scaling | 参数量 N、token 数 D、超参数 recipe | 大规模实验不可穷举 | A3 |
+| Data | 抽取、过滤、去重、混合 | 垃圾数据浪费计算、污染评测 | A4 |
+| Alignment | rollout、reward、policy update | 弱监督噪声、训练不稳、on-policy 新鲜度 | A5 |
+
+基础模型史也服务于这张地图：Shannon 与 n-gram 建立概率语言建模；LSTM、seq2seq、attention 和 Transformer 给出神经机制；ELMo/BERT/T5 证明预训练迁移；GPT-2、GPT-3 与 scaling laws 把规模变成可预测变量；Chinchilla 说明“更大模型”不等于“固定算力下更好”，训练 token 也必须共同扩展。开放权重模型提供权重与论文，真正开放的 OLMo、Nemotron、Marin 还公开代码和数据，使端到端研究可复现。
+
+### 3. 字符串、code point、byte 与 token 不是同一层
+
+以 <code>Hello, 🌍! 你好!</code> 为例：
+
+- Python 字符串是 Unicode code point 序列；<code>ord('a') = 97</code>，但 emoji 的 code point 可达十万以上。
+- UTF-8 把 code point 编成 byte；<code>a</code> 是一个 byte，🌍 是 <code>f0 9f 8c 8d</code> 四个 byte。
+- tokenizer 再把 byte 串映射成词表里的整数 token ID；语言模型只看见这些 ID。
+- decode 必须精确走反方向，保证 <code>decode(encode(x)) == x</code>。
+
+字符 tokenizer 的词表约 15 万且大量字符稀有，既大又压缩差。byte tokenizer 只有 256 项、对任意字节串完备，却固定为 1 byte/token，序列太长。word tokenizer 压缩不错，却会产生巨大、开放的词表；训练未见词只能变成 UNK，甚至破坏困惑度的可比性。
+
+压缩率定义为：
+
+$$
+\text{compression ratio}=\frac{\text{UTF-8 bytes}}{\text{tokens}}.
+$$
+
+它越大，同样上下文窗口能容纳的原文越多，attention 的平方成本也越低。但无上限扩大词表会增加 embedding、输出投影和 softmax 成本，并产生学不充分的稀有 token。因此它是一项资源权衡，不是单调越大越好。
+
+### 4. BPE：训练一个可逆的压缩词典
+
+BPE 最初是数据压缩算法，后来用于神经机器翻译并被 GPT-2 采用。训练从 256 个单 byte token 开始，每轮：
+
+1. 统计当前 token 序列的所有相邻 pair；
+2. 选频率最高的 pair；
+3. 给拼接结果分配新 ID；
+4. 把该 pair 的所有非重叠出现替换为新 ID；
+5. 记录 merge 的先后顺序。
+
+<ExecutionTrace
+  title="在 “the cat in the hat” 上看一次 BPE 状态变化"
+  steps={[
+    { label: '初始化', title: '每个 UTF-8 byte 都是 token', input: 't h e ␠ c a t …', output: 'ID 范围 0…255', explanation: '基础词表必须覆盖全部 byte，因此任何输入都可回退到 byte 序列。' },
+    { label: '计数', title: '统计相邻 pair', input: '(t,h), (h,e), (e,␠)…', output: 'pair → count', explanation: '真实 A1 会先预分词，并用每个 pre-token 的词频加权；特殊 token 还会切断 pair。' },
+    { label: '选中', title: '按规则解决并列', input: '最高计数 pair', output: '(t,h) → 256', explanation: 'merge rank 就是训练时间顺序；并列规则必须确定，测试才能完全复现。' },
+    { label: '替换', title: '一次线性扫描做非重叠合并', input: 't h e … t h e …', output: 'th e … th e …', explanation: '匹配后指针前进 2，否则前进 1；这避免重叠替换。' },
+    { label: '编码', title: '新文本只重放相关 merge', input: 'the quick brown fox', output: 'token IDs → bytes → 原文', explanation: '编码不是“最长词优先”，而是按训练得到的 merge 优先级合并；decode 拼接词表中的 bytes 后再 UTF-8 解码。' },
+  ]}
+/>
+
+最小讲义实现把整个语料直接变成 byte ID 列表，再反复全量计数；A1 要进一步加入 GPT-2 正则预分词、special token 边界和高效增量更新。核心代码的含义如下：
+
+~~~python
+def merge(ids, pair, new_id):
+    out, i = [], 0
+    while i < len(ids):
+        if i + 1 < len(ids) and (ids[i], ids[i + 1]) == pair:
+            out.append(new_id)
+            i += 2
+        else:
+            out.append(ids[i])
+            i += 1
+    return out
+
+def train_bpe(text, num_merges):
+    ids = list(text.encode('utf-8'))
+    vocab = {i: bytes([i]) for i in range(256)}
+    merges = {}
+    for step in range(num_merges):
+        counts = count_adjacent_pairs(ids)
+        pair = max(counts, key=counts.get)
+        new_id = 256 + step
+        merges[pair] = new_id
+        vocab[new_id] = vocab[pair[0]] + vocab[pair[1]]
+        ids = merge(ids, pair, new_id)
+    return vocab, merges
+~~~
+
+这里有三个容易漏掉的正确性条件：
+
+- <code>vocab[new_id]</code> 保存的是两个旧 token 对应 **bytes 的拼接**，不是字符串拼接；
+- Python dict 保留插入顺序，最小编码器据此按训练顺序重放 merge；工程实现可用 rank 显式保存；
+- special token 必须在普通预分词之前被识别，并保持原子性，不能在内部训练或合并。
+
+<CheckpointQuiz
+  question="为什么 BPE 编码不能简单地每次选择词表中能匹配的最长 token？"
+  options={['最长 token 一定包含非法 UTF-8', '词表只说明有哪些 token，merge rank 才定义训练得到的分解优先级', '因为最长匹配不能在线性时间完成', '因为 byte token 不能参与匹配']}
+  answer={1}
+  explanation="同一个词表可能对应不同 merge 顺序；BPE 的模型参数是 vocab 加有序 merges。忽略顺序会得到另一套 token IDs，虽然仍可能解码回原文。"
+/>
+
+### 5. 从这讲进入 A1
+
+先用极小字符串手算三轮 merge，再运行 [A1 工坊](/docs/assignments/assignment-1) 的官方测试。检查顺序是：round-trip → special token → merge tie-break → 预分词边界 → 速度。不要一开始就优化；一份可读、可逐步打印状态的正确实现，是后面增量计数和并行预分词的基准。
+
+### Lecture 1 源码讲义中文全文（按执行顺序）
+
+以下对应 <code>lecture_01.py</code> 的所有讲授文本与可执行示例；导入语句只为链接论文、图片和讲义运行工具，不改变课程含义。
+
+**欢迎与课程缘起。** CS336：从零构建语言模型（2026 春），这是课程第三次开设。第二次开设的录像位于 YouTube。新版继续坚持“从零”哲学，优先单位时间价值高的概念、不因树木失去森林，并增加 MoE、长上下文与 agent 等现代组件。课程产生的原因是研究者日益脱离底层技术：2016 年亲自实现和训练，2018 年下载 BERT 微调，如今常提示 API 模型。提高抽象层会提高生产率，但这些抽象会泄漏，且基础研究仍需要拆开整条栈；完整理解是基础研究的必要条件，课程哲学是通过构建获得理解。
+
+语言模型已经工业化：前沿训练十分昂贵，公开材料又常不披露训练细节。我们能训练十亿参数以下的模型，但它不一定代表大模型，因为 attention 与 MLP 的 FLOPs 占比会随规模变化，某些行为也随规模出现。可迁移知识分机制、方法与直觉：机制是 Transformer 或并行如何工作；方法是挤出硬件能力并严肃对待 scaling；直觉是哪些数据和建模决策提高准确率。机制和方法可以教授并迁移，直觉只能部分迁移。有些设计只能由实验支持，例如引入 SwiGLU 的工作。苦涩教训的错误解读是“只有规模重要”，正确解读是“能扩展的算法重要”；准确率等于效率乘资源，规模越大越不能浪费。问题最终是：给定计算和数据预算，怎样构建最佳模型，也就是最大化效率。
+
+**语言模型发展脉络。** 神经网络以前，Shannon 用语言模型测英语熵，n-gram 用于机器翻译和语音识别。2010 年代的神经组件包括 LSTM、首个神经语言模型、seq2seq、Adam、attention、Transformer、MoE 和模型并行。随后 ELMo 用 LSTM 预训练、BERT 用 Transformer 预训练，T5 把任务统一成 text-to-text。GPT-2 展示流畅文本和早期零样本能力；scaling laws 带来规模扩展的可预测性；GPT-3 展示上下文学习；PaLM 规模巨大但训练不足；Chinchilla 给出计算最优缩放。
+
+早期开源尝试包括 The Pile/GPT-J、复现 GPT-3 但遭遇大量硬件问题的 OPT，以及强调数据来源的 BLOOM。可信开放权重系列包括 Llama、Mistral、DeepSeek、Qwen、Kimi、GLM、MiniMax 与 MIMO；开放源码模型还公开论文、代码和数据，包括 OLMo、Nemotron 与开放开发的 Marin。开放性对信任和创新重要，也让 CS336 能讲解真实方法。语言模型在 2018 年是拿来微调的东西，2020 年是拿来提示的东西，2022 年是对话对象，2026 年则是自主行动的 agent；attention、kernel 和优化等基础不变，但长上下文与推理效率等规格变了。
+
+**可执行讲义与课程安排。** 这份讲义本身是程序，执行程序即可展示课程；因此既能查看和运行代码，也能看到讲义层次。课程信息在官网，课程为 5 学分且作业量很大。适合希望理解机制、锻炼研究工程能力的人；若本季度主要目标是推进研究、只追逐最新技巧或只想在特定应用上取得结果，研讨课、提示或微调现有模型可能更合适。所有讲义与作业在线，并提供录像。
+
+共有五次作业：基础、系统、缩放律、数据、对齐。没有实现脚手架，但提供单元测试和 adapter 接口；先在本地测正确性，再在集群测准确率与速度，部分作业有固定预算下最小化困惑度的榜单。编码 agent 也许能完成作业，但代替思考就学不到东西；AI 更适合作为问答和辅导工具，课程要求遵守其教学型 AGENTS.md 与 AI policy。Modal 提供计算资源，应按指南访问。
+
+**A1 与基础。** 目标是能训练基础语言模型，组件是 tokenization、模型架构与训练。tokenizer 在原始 bytes 与整数 token 序列间转换；BPE 把常见输入块合成 token，可把约 1000 bytes 缩为约 250 tokens，并把更多建模容量分配给信息丰富的块。直接处理 byte 的 ByT5、MEGABYTE、BLT、T-Free、H-Net 很有前景，但尚未扩到最前沿。
+
+架构从原始 Transformer 出发，涉及 ReLU/SwiGLU，sinusoidal/RoPE，LayerNorm/RMSNorm/QK norm、pre/post norm，full/sparse/local attention、GQA、MLA，Mamba/DeltaNet 一类 recurrence、state-space 或 linear attention，dense/MoE MLP，以及 hidden width、depth、head 与 expert 数。训练涉及多 token prediction 等 loss，AdamW/SOAP/Muon，Xavier/muP 初始化，cosine/WSD 学习率，dropout/weight decay，critical batch size，以及 MoE 的负载均衡。A1 要实现 BPE、Transformer、交叉熵、AdamW 与训练循环，核算资源，在 TinyStories/OpenWebText 训练，并在 B200 的 45 分钟预算内竞争。总原则是在表达力、稳定性和训练/推理效率间平衡。
+
+**A2 与系统。** 目标是挤出 GPU/TPU 性能，分 kernel、并行、推理。资源核算描述模型的显存和计算特性；例如 70B 参数、1T token 的粗略训练量为 4.2×10²³ FLOPs。参数必须从 HBM 搬到 SM，B200 的示例峰值是 bf16 2.25 PFLOP/s、带宽 8 TB/s。Roofline 判断计算受限还是内存受限，Nsight 揭示实际执行。一个 PyTorch 原语通常启动一个标准 GPU kernel；自定义 CUDA/Triton/CUTLASS/ThunderKittens kernel 可通过 fusion 与 tiling 减少中间结果回写 HBM，还需理解 warp divergence、coalescing、bank conflict、occupancy 与 bulk-async transfer。
+
+扩到 1024 张 GPU 时，设备间搬运更慢，仍应最小化数据移动；collective 包括 gather、reduce、all-reduce，可切分参数、激活、梯度和优化器状态，并组合 data/tensor/pipeline/sequence/expert parallelism。推理分 prefill 与 decode：prefill 已知所有 token，可并行且常计算受限；decode 每次只产一个 token，常内存受限。可用剪枝、量化、蒸馏得到更便宜模型；speculative decoding 让小 draft 一次提议多个 token、由大模型并行验证且保持精确分布；还可用融合 kernel 与 continuous batching。A2 要实现 Triton 融合 RMSNorm、DDP、优化器分片并完成 benchmark/profile。推荐《How to Scale Your Model》。
+
+**A3 缩放律。** 若最终预算为 10²⁵ FLOPs，不可能在最终规模穷举超参数。应定义从 FLOPs 到超参数的 scaling recipe，在较小规模（如到 10²⁴）采样损失，拟合缩放律，再优化目标规模 recipe 并提前预测损失。缩放律需要精心构造 recipe 与 muP 一类超参数迁移；可预测性至少与单点最优同样重要。经典问题在 C=6ND 下怎样分配模型参数 N 与训练 token D：多个小预算上画 isoFLOP 曲线、找最优 N，再外推。粗略经验 D≈20N，例如 70B 模型约 1.4T token，但它没有计入推理成本，部署常更偏好小而训练更久的模型。A3 通过受预算 API 收集点、拟合定律并提交外推的超参数与损失。
+
+**A4 数据。** 先问模型应具备何种能力：多语言、对话、agentic coding 等。内部评测用于指导开发，重视跨规模平滑和相对变化；外部评测要代表真实使用，重视生态效度。可用未公开文档 perplexity 减少污染，也要覆盖 GPQA、HLE、SWE-Bench、Terminal-Bench 等复杂用途。数据来自网页、书籍、arXiv、GitHub 等，可能涉及 fair use 或授权；HTML、PDF、目录不能直接成为干净文本。处理链包括抽取正文、质量/有害内容过滤、Bloom filter 或 MinHash 去重、来源混合权重，以及把真实数据改写成更接近下游的合成数据。预训练数据要大而多样，mid-training 强调高质量和长上下文，post-training 包含对话与工具调用轨迹。A4 要抽取 Common Crawl HTML、训练质量/有害分类器、用 MinHash 去重，并在 token 预算内优化 perplexity。
+
+**A5 对齐。** 到此模型一直用下一 token 的完整监督；当“批评比生成容易”时，可以利用弱监督继续提高：模型生成回答，由人、verifier 或 LM judge 评分，再让模型偏好更好回答。PPO 来自强化学习，DPO 针对偏好数据更简单，GRPO 去掉 value function。难点是 RL 不稳定、规模化需要异步 rollout 基础设施，以及系统吞吐和 on-policy 程度始终互相制约。A5 实现 DPO 与 GRPO。
+
+**统一效率视角。** 资源包含数据、硬件算力、显存和通信带宽；问题是在固定资源下训练最佳模型。当前通常计算受限，所以系统减少搬运，tokenizer 避免过长 byte 序列，架构共享 KV 或使用滑窗，过滤避免在坏数据上更新，缩放律用小实验调参；未来也可能转为数据受限。
+
+**Tokenization 可执行部分。** tokenizer 提供 encode/decode 抽象接口。原始文本通常是 Unicode string，语言模型给整数 token 序列赋概率，因此需要双向转换。实际 tokenizer 常把前导空格与词合成一个 token，句首和句中同一个词可能不同，数字常每几位切一次。讲义调用 tiktoken 的 o200k_base，验证 round-trip，并把词表输出到文件。
+
+CharacterTokenizer 用 ord 把字符变 code point，用 chr 还原；约 15 万字符造成大词表，emoji 等又很稀有，压缩率仍低。ByteTokenizer 用 UTF-8 在字符串和 0…255 间转换；词表小而完备，但 bytes/token 恒为 1，受 attention 平方成本限制时序列过长。Word tokenizer 用正则把字母数字连在一起；token 对人有意义、压缩较好，却有巨大词表、稀有词、词表大小不固定和未登录词 UNK 等问题。
+
+BPE 由 Philip Gage 1994 年提出用于压缩，随后用于神经机器翻译并被 GPT-2 采用。它在训练数据上构造定制词表：常见 byte 串由一个 token 表示，罕见串由多个 token 表示。从 byte 开始，连续合并最常见相邻 pair。讲义在 “the cat in the hat” 上做三轮训练，再编码 “the quick brown fox” 并验证还原。最小 encode 会遍历全部 merge，A1 应只处理相关 merge，保留 `<|endoftext|>` 等 special token，使用 GPT-2 正则预分词并尽量提速。
+
+可执行的 <code>merge</code> 用指针扫描：若当前位置与下一项等于 pair，写入 new_index 并前进两格，否则复制当前项并前进一格。<code>train_bpe</code> 初始化 byte IDs、空 merges 与 256 项 byte vocab；每轮统计 adjacent pairs，取计数最大者，分配 256+i，把两个旧 bytes 拼接进 vocab，再替换序列；最终返回 vocab 与有序 merges。<code>count_adjacent_pairs</code> 对序列和右移一位后的序列做 zip，并在字典中累加。总结：tokenizer 在 string 与 token IDs 间双向转换；字符、byte、word 三种极端都不理想；BPE 是数据驱动的有效启发式。未来也许能端到端处理 byte，但任何方案都应让模型在可变、富含抽象意义的块上计算，把更多容量分配到更值得建模的位置。下一讲进入资源核算。
 
 ## Lecture 2：资源核算是一种调试语言
 
-### Tensor、dtype 与 shape
+如果不会先做数量级核算，就很容易花一天优化只占总耗时 1% 的算子，或在启动训练后才发现模型状态根本装不下。这讲把 tensor 当作统一账本：数据、参数、梯度、激活和优化器状态，全都有 shape、dtype、device、bytes 和 FLOPs。
 
-`einsum('btd,df->btf', x, w)` 把 batch/time/feature 轴写明。FP32 4 bytes，BF16/FP16 2 bytes；BF16 指数范围接近 FP32、尾数更短，FP16 尾数更细但指数范围小。混合精度通常让大 matmul 用低精度、reduction/累积用 FP32，并保留 FP32 master weights/optimizer state。
+<TermDeck
+  title="资源核算必会术语"
+  items={[
+    { term: 'FLOP', expansion: 'Floating-Point Operation', chinese: '一次浮点运算', explanation: '加法或乘法等一项计算。FLOPs（复数）描述工作总量；FLOP/s 描述硬件速度，两者读音相同却不是同一量。', example: '[B,M,K] × [K,N] ≈ 2BMKN FLOPs' },
+    { term: 'MFU', expansion: 'Model FLOPs Utilization', chinese: '模型算力利用率', explanation: '实际完成的有效模型 FLOP/s 除以该 dtype 下硬件理论峰值。它会被通信、数据等待、小 kernel 和同步空泡拉低。' },
+    { term: 'AMP', expansion: 'Automatic Mixed Precision', chinese: '自动混合精度', explanation: '框架按算子安全性自动选择低精度或高精度；矩阵乘常用 bf16，exp、归约或长时间累积常保留 fp32。' },
+    { term: 'AI', expansion: 'Arithmetic Intensity', chinese: '算术强度', explanation: '完成的 FLOPs 除以从显存搬运的 bytes。它不是人工智能；数值越高，越有机会成为 compute-bound。' },
+    { term: 'SM', expansion: 'Streaming Multiprocessor', chinese: '流式多处理器', explanation: 'NVIDIA GPU 上实际执行线程块和张量核心计算的单元；数据必须先从 HBM 进入片上层级。' },
+  ]}
+/>
 
-### FLOPs 怎么数
+### 1. 先做两道餐巾纸估算
 
-`[B,M,K] @ [K,N]` 约 `2BMKN` FLOPs。线性层参数 P 在每个 token 前向约 `2P`；反向对输入和权重各一次类似 matmul，约再 `4P`，故 dense Transformer 训练粗估 `6×tokens×non-embedding parameters`。attention 的 `QKᵀ` 与 `PV` 另含约 `4BHT²Dh`，长 T 时不能忽略。
+训练 70B 参数模型、数据量 15T tokens 时，用近似式：
 
-这个近似用于量级规划，不包含 embedding lookup、norm、softmax、optimizer、重算、通信和硬件空泡。真实时间还受利用率影响。
+$$
+C \approx 6ND = 6\times 70\times10^9\times 15\times10^{12}
+  = 6.3\times10^{24}\ \text{FLOPs}.
+$$
 
-### 内存分解
+若有 1024 张 H100，dense bf16 峰值按每卡约 989.5 TFLOP/s，MFU 按 50%，训练天数近似为总 FLOPs 除以“每卡有效 FLOP/s × 卡数 × 86400”。这是估算，不是承诺：数据加载、网络、checkpoint 和故障都会延长墙钟时间。
 
-FP32 AdamW 直觉账本：参数 4P、梯度 4P、m/v 共 8P，尚未计激活；混合精度实现还可能有低精度参数副本。激活随 B、T、L、D 增长，标准 attention 概率随 T²。梯度累积减小每次 microbatch 激活但不减少模型状态；activation checkpoint 保存边界、反向重算内部，省显存但加 FLOPs。
+另一个问题是 8 张 80 GB H100 最多装多大模型。若参数 bf16 2 bytes、梯度 bf16 2 bytes、Adam 的一阶/二阶状态各 fp32 4 bytes，则先忽略激活：
 
-### Roofline
+$$
+\text{bytes/parameter}=2+2+4+4=12,
+\qquad P_{\max}<\frac{8\times80\text{ GB}}{12}.
+$$
 
-算术强度 `I=FLOPs/bytes`；硬件平衡点 `I_hw=peak_FLOPs/memory_bandwidth`。若 `I<I_hw`，再加计算单元也难提速，应该减少数据搬运/融合；若更高，才主要受计算峰值限制。MFU 把端到端有效训练 FLOPs 除以设备理论峰值，数据等待、通信和小 kernel 都会拉低它。
+它只是上界，因为真实训练还要放激活、临时 buffer、通信 bucket，部分混合精度配置还保存 fp32 master weights。
+
+### 2. shape 与 dtype：每个数字占多少空间
+
+tensor 的 rank 是维数个数。Transformer 常见 rank-4 张量为 <code>[B,S,H,D_h]</code>：batch、sequence、head、每头维度。显存公式非常朴素：
+
+$$
+\text{memory}=\operatorname{numel}(x)\times\operatorname{element\_size}(x).
+$$
+
+<TensorShapeLab />
+
+常用浮点格式的关键不是只看 bit 数，而是区分 exponent（动态范围）与 mantissa（分辨率）：
+
+| dtype | bytes | 特点 | 常见用途 |
+| --- | ---: | --- | --- |
+| fp32 | 4 | 范围与分辨率都较好 | optimizer state、归约、调试基线 |
+| fp16 | 2 | 分辨率较好但指数范围窄，1e-8 可下溢到 0 | 有 loss scaling 的旧式混合精度 |
+| bf16 | 2 | 指数范围与 fp32 相同，尾数更短 | 参数、激活、大矩阵乘 |
+| FP8 E4M3 / E5M2 | 1 | 一个偏精度、一个偏范围，需要 scaling | 新硬件训练/推理 |
+| NVFP4 | 0.5 加 scale 开销 | 每块共享 scale，值集合离散 | 极低精度训练/推理研究 |
+
+混合精度不是“把整个模型 cast 成 bf16”。讲义推荐参数、激活、梯度用 bf16，长期累积的优化器状态用 fp32；AMP 会尽量把 matmul 降精度，而 exp 一类敏感算子不贸然降精度。
+
+### 3. 用名字而不是负轴记 shape
+
+<code>x @ y.transpose(-2,-1)</code> 很难仅凭一眼确认轴语义。einops 让轴有名字：
+
+~~~python
+scores = einsum(
+    q, k,
+    'batch query hidden, batch key hidden -> batch query key',
+)
+summed = reduce(x, 'batch seq hidden -> batch seq', 'sum')
+heads = rearrange(x, '... (heads head_dim) -> ... heads head_dim', heads=8)
+~~~
+
+规则是：输入中出现、输出中消失的轴被求和；省略号代表任意批量前缀；括号可拆开或合并轴。轴名不只是美观，它会把 silent shape bug 变成可读的接口。
+
+### 4. FLOPs：为什么训练粗估是 6ND
+
+矩阵乘 <code>[B,M,K] @ [K,N]</code> 的每个输出需要 K 次乘法和约 K 次加法，因此约为 <code>2BMKN</code>。对线性层 <code>H=XW</code>：
+
+- forward 的 <code>XW</code>：约 2 × 数据点数 × 参数量；
+- backward 求 <code>dX=dH Wᵀ</code>：约 2 × 数据点数 × 参数量；
+- backward 求 <code>dW=Xᵀ dH</code>：再约 2 × 数据点数 × 参数量。
+
+所以训练总计近似 <code>6 × data points × parameters</code>。把 data points 解释成 tokens，就得到常用的 <code>6ND</code>。短上下文 dense Transformer 中它很有用；长上下文时 attention 的 <code>QKᵀ</code> 与 <code>PV</code> 约含 <code>4BH S² D_h</code>，必须单列。embedding lookup、norm、softmax、optimizer、重算、通信和空泡也不在 6ND 内。
+
+<ScalingLab />
+
+MFU 定义为：
+
+$$
+\text{MFU}=\frac{\text{actual effective model FLOP/s}}
+{\text{peak FLOP/s for this dtype}}.
+$$
+
+超过 0.5 通常已经不错。benchmark GPU 时必须在计时前后 synchronize，否则只测到异步 kernel launch 的时间。
+
+### 5. Roofline：慢在算，还是慢在搬
+
+一次算子的最短时间受两条下界控制：
+
+$$
+t_{compute}=\frac{F}{P_{peak}},\qquad
+t_{memory}=\frac{B_{moved}}{BW},qquad
+t\ge\max(t_{compute},t_{memory}).
+$$
+
+定义工作负载算术强度 <code>I=F/B_moved</code>，硬件平衡点 <code>I_hw=P_peak/BW</code>：
+
+- <code>I &lt; I_hw</code>：memory-bound，应减少读写、做 fusion 或扩大复用；
+- <code>I &gt; I_hw</code>：compute-bound，优化 Tensor Core 利用、tile 和矩阵形状。
+
+讲义在 bf16 下逐项算出：ReLU 约 1/4 FLOP/byte，GELU 虽约做 20 次操作仍常 memory-bound；dot product 约 1/2；matrix-vector 约 1；大方阵 matmul 约 n/3，终于跨过平衡点。由此解释：训练中的大 GEMM 常计算受限，逐 token decode 的 matrix-vector 常内存受限。孤立 ReLU 未必比 GELU 快，因为两者都主要付同样的 HBM 读写费。
+
+### 6. 模型状态与两种显存换法
+
+讲义的深网每层是 <code>x @ W</code> 后接 ReLU，L 层、宽 D 时参数为 <code>LD²</code>。以 bf16 参数/梯度和 fp32 optimizer state 记账：
+
+| 部分 | AdaGrad | Adam |
+| --- | ---: | ---: |
+| 参数 | 2P | 2P |
+| 梯度 | 2P | 2P |
+| optimizer state | 4P | 8P |
+| 激活（极简网） | 约 2BLD | 约 2BLD |
+
+AdaGrad 累积 <code>g2 += grad²</code>，更新 <code>p -= lr·grad/sqrt(g2+ε)</code>；RMSProp 把平方梯度改成指数平均；momentum 是梯度指数平均；Adam 把 momentum 与 RMSProp 合并。<code>zero_grad(set_to_none=True)</code> 还能让旧梯度 storage 被释放/重建。
+
+梯度累积把总批量拆成 microbatch，不清零梯度，累计若干次才 step。它把 activation memory 从总批量 B 降到 microbatch b，但不减少参数、梯度和 optimizer state；为了等价于大批量平均，loss 要除以累积步数。
+
+Activation checkpointing、gradient checkpointing、rematerialization 是同一思想：前向只保存部分边界，反向从最近 checkpoint 重算缺失激活。保存每层时激活显存 O(L)、无重算；一层不存会达到 O(1) 显存但可恶化为 O(L²) 重算；每隔 √L 层存一次，可做到 O(√L) 激活显存与 O(L) 级重算。
+
+<CheckpointQuiz
+  question="把总 batch 64 拆成 4 个 microbatch 后，什么显存不会因此下降？"
+  options={['每层激活', '参数和 Adam optimizer state', 'attention 临时张量', '输入 batch tensor']}
+  answer={1}
+  explanation="microbatch 只缩小与 batch 成比例的激活和临时量；模型状态始终完整驻留。若模型状态本身装不下，需要 ZeRO/FSDP 等分片。"
+/>
+
+### Lecture 2 源码讲义中文全文（按执行顺序）
+
+**开场。** 公告包括加入 CS336 Slack、用 Stanford 邮箱注册 Modal、阅读 AI policy 与集群指南。Marin 的 10²³ FLOPs 训练已经完成并吻合预测。上一讲是课程概览与 tokenization；本讲研究系统资源核算。回顾问题：给定计算和显存，能训练的最佳模型是什么，也就是最大化计算效率。前提是理解一项计算需要多少 compute 与 memory。本讲机制层是 PyTorch 语义，方法层是始终记得做资源核算，直觉层是资源花到哪里；没有神秘的机器学习技巧。
+
+**两个动机问题。** 70B 模型在 15T tokens 上训练，总量按 6ND 计算；H100 dense 峰值取稀疏标称值的一半，MFU 取 0.5，再乘 1024 张卡和每天秒数可估训练天数。8 张 80GB H100 上训练 AdamW 模型，参数 2 bytes、梯度 2 bytes、两个 optimizer state 各 4 bytes，按 12 bytes/parameter 求参数量上界；未计 batch/sequence 决定的激活，所以只是上界。这类背面餐巾纸估算用于迅速形成资源量级。
+
+**Tensor 基础。** tensor 保存数据、参数、梯度、optimizer state 与 activation。DeepSeek V3.2 权重文件就是参数 tensor 的实例。rank 等于维数；向量 rank 1、矩阵 rank 2，Transformer 常出现 rank 4 的 B×S×H×D 张量。浮点 tensor 的显存由元素数与每元素 dtype 大小决定。fp32 又叫 float32/single precision，是默认值；科学计算有时用 fp64，而深度学习容许更低精度。4×8 fp32 有 32 个元素、每项 4 bytes，共 128 bytes；GPT-3 FFN 的一个 12288×49152 fp32 矩阵约 2.3 GiB。
+
+fp16 每项 2 bytes，但小数动态范围差，1e-8 会下溢到 0，从而导致训练不稳。Google Brain 在 2018 年设计 bf16：与 fp16 同占 2 bytes，却保留 fp32 的动态范围，代价是分辨率更低；1e-8 不会下溢。全 fp32 稳但耗显存，全 fp16/bf16 也可能不稳；混合精度可让参数、激活和梯度用 bf16，optimizer state 用 fp32。PyTorch AMP 在安全时自动转换，例如 matmul，而不轻易转换 exp。
+
+FP8 在 2022 年为机器学习标准化；H100 支持 E4M3（范围约 -448 到 448）与 E5M2（约 -57344 到 57344）。2025 年 NVIDIA 推出 NVFP4，每值仅 4 bits，可表示有限离散值并为每个 block 使用单独 scale，因此扩大整体范围但相邻值不能任意独立变化；Nemotron 3 Super 使用 NVFP4 训练。其中部分逻辑在 NVIDIA 库内完成，不完全受用户控制。
+
+tensor 默认在 CPU 内存；要使用 GPU 大规模并行，需用 <code>to(device)</code> 搬到 GPU，或在 GPU device context 直接创建。einops 用命名维度操作 tensor，灵感来自 Einstein summation。传统 <code>x @ y.transpose(-2,-1)</code> 容易搞错 -2/-1；einsum 把 <code>seq1 hidden, hidden seq2 -&gt; seq1 seq2</code> 写清。更复杂时，对 batch 共享、对 hidden 求和得到 batch×seq1×seq2；输出未出现的输入轴被求和，省略号表示任意广播前缀。reduce 可按命名轴 sum/mean/max/min。rearrange 能把 total_hidden 拆成 heads×hidden1，对 hidden1 做矩阵变换，再把 heads×hidden2 合回一轴。
+
+**FLOPs。** FLOP 是一次加法或乘法；FLOPs 是完成的浮点操作总数，FLOP/s（也写 FLOPS）是硬件速度。GPT-3 训练约 3.14×10²³ FLOPs，GPT-4 被推测约 2×10²⁵。H100 的带稀疏标称峰值为 1979 TFLOP/s，dense 取一半；可估 8 张 H100 两周可完成的总量。对 B×D 乘 D×K，每个 i,j,k 贡献一次乘与一次加，约 2BDK FLOPs。实测耗时后，以工作量除时间得实际 FLOP/s，再按设备与 dtype 查理论峰值；MFU 是两者之比，忽略通信和额外开销，0.5 以上往往很好。要理解为何不能接近 1，需要观察 GPU 的数据搬运。
+
+**算术强度。** 执行一项计算要把输入从 memory 发到 accelerator、计算、再把输出写回。时间取决于 FLOP/s 与 bytes/s。H100 示例 dense 计算峰值约 989.5 TFLOP/s，带宽约 3.35 TB/s。假设搬运和计算完美重叠，总时间取二者最大值。ReLU 对 n 个 bf16 读 2n bytes、写 2n bytes、做 n 次比较，通信远慢于计算，是 memory-bound。硬件强度为峰值 FLOP/s 除带宽，工作算术强度为实际 FLOPs 除 bytes；工作强度低于硬件强度则受内存限制，反之受计算限制。
+
+GELU 每元素可近似计 20 FLOPs，移动 bytes 与 ReLU 相同，因此强度更高，却仍 memory-bound；孤立执行时 ReLU 因而未必更快。两个 bf16 向量点积读两向量、写一个标量，约 2n−1 FLOPs，强度约 1/2，仍受内存限制。n×n 矩阵与向量相乘读整矩阵，强度约 1，也受内存限制。两个 n×n 矩阵相乘能对读入元素大量复用，强度约 n/3，大矩阵最终计算受限。Transformer 训练有大 matmul，而推理 decode 常是 matrix-vector，所以后者常 memory-bound。dtype 同时改变算力峰值和 bytes，强度结论也随精度改变。
+
+Roofline 图横轴是每种计算的算术强度，每条分段线代表一种硬件，折点就是硬件平衡强度，从左侧 memory-bound 转到右侧 compute-bound。理想化关系可写为 MFU=min(1, 工作强度/硬件强度)。
+
+**梯度与 6ND。** 前面只做 forward，现在计算 backward。简单例子为 <code>loss=0.5(x·w−5)²</code>；令 w 需要梯度，前向算 loss，backward 后 w.grad 等于 [1,2,3]。两层线性网络中，第二层 h2=h1W2 的 forward 是 2BD² FLOPs；backward 同时求 h1.grad=h2.grad W2ᵀ 与 W2.grad=h1ᵀ h2.grad，各花约 2BD²。因此 backward 是 forward 的两倍。扩到全网：forward 约 2×数据点×参数，backward 约 4×数据点×参数，总计 6×数据点×参数。该式严格针对 MLP，但短上下文 Transformer 也可近似使用。
+
+讲义定义 L 层、D 维深网，每个 Block 的权重初始化除以 √D，forward 做线性变换和 ReLU；ModuleList 顺序应用各层，参数总数为 LD²。优化器示例说明：momentum 是 SGD 加梯度指数平均；AdaGrad 用累计平方梯度缩放 SGD；RMSProp 把平方梯度改成指数平均；Adam 是 RMSProp 加 momentum。AdaGrad state 为每参数累计 g²，参数更新为减去 lr×grad/√(g²+1e-5)。调用 step 后用 zero_grad(set_to_none=True) 释放旧梯度。
+
+以 bf16 记，参数和梯度各 2P bytes；AdaGrad 的 fp32 second moment 为 4P，Adam 的 first+second moment 为 8P；极简深网激活约 2BLD。optimizer state 用 fp32，因为它跨很多步累计幂次平均，需要稳定性。一次训练 step 计算仍约 6BP。Transformer 账本更复杂，A1 会要求逐组件计算。
+
+**训练循环与省显存。** 合成数据由真实权重 [0,1,…,D−1] 产生；每步取 batch，模型前向与 MSE，backward，optimizer.step，再清梯度。大 batch 提高训练稳定性，却让激活显存随 B 增长。梯度累积在 microbatch 上算梯度且不清零，每经过 batch_size/micro_batch_size 次才更新并清零，从而降低峰值激活。
+
+训练反向需要所有层激活，推理不求梯度时只需当前层。Activation checkpointing 也叫 gradient checkpointing/rematerialization：前向只留一部分层的激活，反向从最近边界重算，拿 compute 换 memory。每层都存是 O(L) 激活、零重算；全不存是 O(1) 激活、O(L²) 重算；每 √L 层保存一次可得 O(√L) 激活与 O(L) 重算。PyTorch 用 <code>torch.utils.checkpoint.checkpoint(layer,x)</code> 包裹层。辅助函数按 numel×element_size 算显存，按 A100/H100/B200 与 dtype 返回 dense 峰值；benchmark 在 CUDA 前后 synchronize 并多次计时；参数量是所有参数 numel 之和。
+
+总结：一切都是 tensor 操作；einops 改善 shape 推理；每训练数据点每参数约 6 FLOPs；用算术强度和 Roofline 判断 compute/memory bound；大 matmul 通常计算受限、elementwise 通常内存受限；梯度累积和 activation checkpointing 用额外时间或多步换取更小峰值显存。
 
 ## Lecture 3：从 2017 Transformer 到现代 decoder
 
-原始 Transformer 是 encoder-decoder、sinusoidal absolute position、post-LayerNorm、ReLU FFN 和 dropout。现代预训练 decoder 常用 causal self-attention、pre-RMSNorm、RoPE、SwiGLU、无 bias，并按规模采用 GQA/滑窗/QK norm 等稳定或效率技巧。
+原始 Transformer 使用 post-LayerNorm、正弦位置向量、ReLU FFN 与 bias。A1 实现的是更接近现代 decoder 的保守基线：pre-RMSNorm、RoPE、SwiGLU、无 bias。重要的不是背一张“最佳组件表”，而是理解每个差异在优化稳定性、数据搬运、表达力或推理成本中的作用，以及证据强弱。
 
-### Normalization 选择
+<TermDeck
+  title="架构缩写先拆开"
+  items={[
+    { term: 'RoPE', expansion: 'Rotary Position Embedding', chinese: '旋转位置编码', explanation: '按位置把 query/key 的成对坐标旋转，使内积中的位置项只依赖相对距离。它作用在每层 Q/K 上，不是加到初始 token embedding。' },
+    { term: 'GLU', expansion: 'Gated Linear Unit', chinese: '门控线性单元', explanation: '把一个投影经过非线性后，与另一线性投影逐元素相乘；SwiGLU 使用 Swish/SiLU 作为门。', example: 'SwiGLU(x) = (SiLU(xW₁) ⊙ xW₃)W₂' },
+    { term: 'MQA', expansion: 'Multi-Query Attention', chinese: '多查询注意力', explanation: '保留多个 query 头，但所有头共享一组 K/V；显著缩小 decode 时要读取的 KV cache。' },
+    { term: 'GQA', expansion: 'Grouped-Query Attention', chinese: '分组查询注意力', explanation: '把 query 头分组，每组共享一个 K/V 头，是 MHA 与 MQA 之间可调的质量—效率旋钮。' },
+    { term: 'SWA', expansion: 'Sliding-Window Attention', chinese: '滑动窗口注意力', explanation: '每个 token 只直接注意附近固定窗口，把 O(S²) 边数降到 O(SW)；常与少数 full-attention 层交错。' },
+    { term: 'NoPE', expansion: 'No Position Embedding', chinese: '无位置编码注意力', explanation: '某些全局层不显式施加位置编码，用来承载不被局部 RoPE 距离偏置限制的长程连接。' },
+  ]}
+/>
 
-LayerNorm 减均值再除标准差；RMSNorm 只除均方根。pre-norm 为残差路径提供接近恒等的梯度高速路，深模型更稳，但最终 block 更新比例可能随深度变化。QK norm 对 Q/K 归一化以抑制 attention logit 爆大；z-loss 惩罚 log-partition 过大；logit soft-cap 用平滑函数限制极端值。这些是稳定性补丁，不应在 A1 基线未正确时一次全加。
+### 1. Pre-norm 保住残差“高速路”
 
-### FFN 与超参数
+设子层为 F。post-norm 与 pre-norm 分别是：
 
-普通 FFN 两矩阵，隐藏宽约 4D；SwiGLU 三矩阵，为近似匹配参数量用 `Dff≈8D/3` 并向 64/256 等硬件倍数取整。模型更深与更宽的训练/推理和并行特性不同；head dim 常保持 64/128，头数随 D 增长。词表增大改善压缩却加重 embedding/head。
+$$
+x_{l+1}=\operatorname{Norm}(x_l+F(x_l)),
+\qquad
+x_{l+1}=x_l+F(\operatorname{Norm}(x_l)).
+$$
 
-### Position 与 KV 成本
+pre-norm 的主残差路径从输入到深层保持加法恒等映射，梯度可以沿 $\partial x_{l+1}/\partial x_l$ 中的 1 直接传播；post-norm 每层都把这条路径穿过 normalization Jacobian，更容易出现梯度衰减或 spike。现代大模型几乎都避免 residual 内 post-norm，BERT 与 OPT-350M 是讲义点出的旧式/例外案例。
 
-RoPE 对 Q/K 的二维 pair 旋转，点积显式依赖相对位移。MQA 让所有 Q 头共享一组 K/V，GQA 介于 MHA 与 MQA，在质量和 KV cache 间调节。滑窗 attention 把大多数层限制在局部、少数层保持全局，长上下文成本下降但远距离信息路径变长。
+“pre-norm”不表示 block 结束后绝不能 norm。Grok、Gemma 2 等采用 double norm，OLMo 2 使用 **non-residual post-norm**：把额外 norm 放在子层输出一侧，再与 residual 相加，仍不切断主路径。判断图时只问一句：从 x 到下一个 x 的加法支路是否必须经过 norm？
+
+### 2. RMSNorm 与去 bias：FLOPs 少不是主要解释
+
+LayerNorm 对最后一维先减均值再除标准差，并有 scale γ 与 bias β；RMSNorm 不减均值、通常也没有 β：
+
+$$
+\operatorname{RMSNorm}(x)
+=\frac{x}{\sqrt{\frac{1}{d}\sum_{i=1}^d x_i^2+\epsilon}}\odot\gamma.
+$$
+
+大矩阵乘占绝大多数 FLOPs，因此省掉一次 mean 并不会显著改变理论 FLOPs；真正的墙钟收益来自更少的读取、写回与参数搬运。实验也观察到 RMSNorm 的运行时收益，有时还有质量收益。相同逻辑解释现代线性层普遍去 bias：bias 计算少，却要额外加载参数、启动/融合操作，且可能影响稳定性。
+
+### 3. FFN：为什么 SwiGLU 的宽度是 8D/3
+
+普通 FFN 是 <code>σ(xW₁)W₂</code>。ReLU 截断负数；GELU 近似按高斯概率平滑门控。GLU 家族额外引入 V：
+
+$$
+\operatorname{FF}_{GLU}(x)
+=\big(\phi(xW_1)\odot xV\big)W_2.
+$$
+
+ReGLU、GeGLU、SwiGLU 只改变 φ；SwiGLU 的 φ 是 <code>Swish(x)=x·sigmoid(x)</code>。普通 FFN 有约 <code>2DD_ff</code> 个矩阵参数，gated FFN 有约 <code>3DD_ff</code>。若普通基线取 <code>D_ff=4D</code>，让参数量相近：
+
+$$
+3D D_{ff}^{GLU}\approx 2D(4D)
+\Rightarrow D_{ff}^{GLU}\approx\frac{8}{3}D.
+$$
+
+所以“8/3”不是神秘最优常数，而是三矩阵对两矩阵的参数匹配起点。硬件实现还会把宽度向合适倍数取整。多项实验较一致地支持 GeGLU/SwiGLU，但 GPT-3 说明 GLU 不是模型能工作的必要条件。
+
+串行 block 先 attention 再 MLP；GPT-J、PaLM、GPT-NeoX 等曾并行计算两支。并行形式可共享 LayerNorm 并融合投影，减少依赖链，但现代多数模型仍采用串行；Cohere Command A、Falcon 2 11B、Command R+ 是讲义列出的近期并行例子。
+
+### 4. RoPE：从相对位置要求推到旋转
+
+理想的相对位置表示 f 希望满足：
+
+$$
+\langle f(x,i),f(y,j)\rangle=g(x,y,i-j).
+$$
+
+把正弦或可学习 absolute embedding 直接加到 token 向量，会产生 token—position 交叉项，不能只由 i−j 表示。RoPE 抓住旋转矩阵性质 $R_i^\top R_j=R_{j-i}$。把 head 维度两两配对，对第 m 对坐标用频率 θm 旋转：
+
+$$
+R_{i,m}=
+\begin{bmatrix}
+\cos(i\theta_m)&-\sin(i\theta_m)\\
+\sin(i\theta_m)& \cos(i\theta_m)
+\end{bmatrix}.
+$$
+
+于是：
+
+$$
+(R_iq)^T(R_jk)=q^TR_i^TR_jk=q^TR_{j-i}k,
+$$
+
+位置只通过差值进入。实现时先把 Q/K 的偶数与奇数维配对，按 position 与 inverse frequencies 生成 cos/sin，再旋转；V 不旋转。RoPE 在 **每一次 attention 的 Q/K** 上施加，从而维持层层相对位置性质，它不是在网络入口加一次位置向量。
+
+<ExecutionTrace
+  title="一对 RoPE 坐标如何进入 attention"
+  steps={[
+    { label: '投影', title: '从 hidden 得到 q 与 k', input: 'xᵢWq, xⱼWk', output: 'qᵢ, kⱼ ∈ ℝᵈʰ', explanation: '内容投影尚未包含位置；先 reshape 成 heads × head_dim。' },
+    { label: '配对', title: '把 head_dim 两两组成二维平面', input: '(q₀,q₁),(q₂,q₃)…', output: 'd_head / 2 个坐标对', explanation: 'head_dim 通常必须为偶数；不同坐标对使用不同频率。' },
+    { label: '旋转', title: '按位置乘 cos/sin', input: 'Rᵢqᵢ, Rⱼkⱼ', output: 'q_rot, k_rot', explanation: '位置越远，角度差越大；计算时通常缓存 cos/sin 表。' },
+    { label: '点积', title: '绝对角度抵消', input: '(Rᵢq)ᵀ(Rⱼk)', output: 'qᵀRⱼ₋ᵢk', explanation: '最终 logit 只依赖相对位移 j−i，这就是推导目标。' },
+  ]}
+/>
+
+### 5. 哪些超参数有强共识，哪些只是默认
+
+**FFN 比例。** 非 gated 模型通常 <code>D_ff≈4D</code>；GLU 参数匹配后通常约 <code>8D/3</code>，实际模型分布在 2.5–4 左右。T5 11B 曾用 65536/1024=64 的极端比例且仍能训练，但改进版 T5 v1.1 回到 GeGLU 2.5 倍，说明“能工作”不等于计算最优。Kaplan 的实验显示约 1–10 倍存在较平坦的好区域。
+
+**head 投影总宽。** 常见规则 <code>num_heads×head_dim≈D</code>，但数学上不是必须。讲义表格中的 ratio 包括 GPT-3/Llama 2 为 1，LaMDA 为 2，PaLM 约 1.48，T5 原版甚至 16；这条规则的行业共识强，严格验证却弱。现代 head_dim 常见 64、128 或 256。
+
+**深宽比。** <code>D/n_layers</code> 常落在约 100–200，GPT-3/OPT/Mistral/Qwen/OLMo 3 约 128；更深模型顺序依赖更长、更难 pipeline parallel、单 token latency 更高，所以 systems 约束会决定落点。讲义列出的范围从 BLOOM 205 到 T5 11B 的 33，绝不是硬定律。
+
+**词表。** 单语模型常约 30k–50k；多语/生产系统常 100k–250k，因为要覆盖更多文字系统并控制 token 膨胀。大词表改善压缩和多语公平性，却扩大 embedding/lm-head 与 softmax。
+
+**正则化。** 预训练数据可能多于参数且通常只遍历一轮，因此新模型很少用 dropout；较旧模型常取 0.1。现代模型更多依赖 weight decay，例如 Llama 取 0.1。它未必是为防经典过拟合，更多通过与学习率（尤其 cosine schedule）交互改变优化动力学。
+
+### 6. 稳定性：看住两个 softmax
+
+输出 softmax 的 partition <code>Z=Σ exp(logit)</code> 可持续变大而不显著改变相对概率，造成数值风险。z-loss 对 log partition 加平方惩罚：
+
+$$
+L_z=\lambda\left(\log\sum_j e^{z_j}\right)^2.
+$$
+
+PaLM、Baichuan 2、DCLM、OLMo 2/3 使用过它。attention softmax 前的 Q/K norm 则直接控制点积尺度；它最早常见于视觉/多模态模型，后来进入 DCLM、OLMo、Gemma、Qwen 等。logit soft-cap 用 <code>c·tanh(z/c)</code> 平滑限制极端值，防爆炸但也可能压缩有效区间、损害性能。这些补丁应有监控证据后逐一引入，而不是掩盖错误实现。
+
+### 7. MHA → MQA/GQA：优化 decode 的 KV 搬运
+
+训练或 prefill 能并行处理 n 个 token，大矩阵复用较好；自回归 decode 每次新增一个 token，必须读取历史 K/V。标准 MHA 每层 KV cache 元素量约：
+
+$$
+2\times B\times S\times H_{kv}\times D_h.
+$$
+
+MQA 令 <code>H_kv=1</code>，所有 query heads 共享 K/V；GQA 取 <code>1&lt;H_kv&lt;H_q</code>。这不会消除 attention 对上下文长度 n 的线性读取，但把每个位置的 K/V 头数缩小约 <code>H_q/H_kv</code> 倍。早期 MQA 观察到小幅 perplexity 损失，GQA 通常能以更小或近零质量损失换取大部分带宽收益；DeepSeek V2 的 MLA 则把 KV 压到 latent 表示。
+
+full attention 是 O(S²) 连接。稀疏或滑窗模式用表达力换运行时；现代常见方案是多数 local/SWA 层加周期性 full 层，例如 Command A 每四层一层 full。局部层可用 RoPE，长程层可用 NoPE；Llama 4、Gemma 3/4、OLMo 3 与 Qwen 系列有不同交错 recipe。远距离信息仍可经 full 层或多层局部传播，但路径长度和精确召回能力会改变。
+
+### Lecture 3 PDF 中文全文（67 页，按页序）
+
+**第 1–2 页。** 标题是“关于 LM 架构与超参数，你完全不想知道的一切”，CS336，Tatsu Hashimoto。目标是快速回顾要实现的现代 Transformer，找出大型 LM 的共同点，以及架构/训练过程的常见变化。今日主题：最好是亲手积累经验，次好是从别人经验中学习。
+
+**第 3–5 页。** 起点是原始 Transformer：正弦/余弦位置 embedding、ReLU FFN、post-LayerNorm。课程实现的简单现代变体把 LayerNorm 放到 block 前，用 RoPE，FFN 用 SwiGLU 而非 ReLU，linear 与 norm 都无 bias。问题是为何选择这些、自己应如何选。仅 2024–2025 就有超过 19 个新 dense 模型发布，很多只做小改动；模型发布多到一页放不下。
+
+**第 6–9 页。** 应从大量模型和论文的数据中学习：哪些共同、哪些变化、能得出什么。覆盖 activation/FFN、attention 变体、position embedding；讨论 FF width、multi-head 总宽、vocab、正则化、深宽等超参数与稳定性技巧。高层趋势是 Llama-like 架构占主导，近年增加 QK norm 与 hybrid attention。
+
+**第 10–13 页。** 2024 年几乎人人认同 pre-norm：设置 LayerNorm 时不要影响左侧主 residual signal path；现代 LM 几乎都用 pre-norm，BERT 是 post-norm，OPT-350M 是一个原因不明的例外。数据与 Xiong 2020 等分析展示 post/pre 差异；解释包括 post-norm 的梯度衰减与梯度 spike。原始卖点是可去 warmup，如今重点是在大网络中稳定并允许更大学习率。如果 residual 内 post-norm 不好，可以把 post-norm 放到 residual 外；Grok、Gemma 2 使用 double norm，OLMo 2 只做 non-residual post norm。
+
+**第 14–19 页。** 原始 Transformer 用 LayerNorm，在 model dimension 上归一化均值和方差，代表模型有 GPT-1/2/3、OPT、GPT-J、BLOOM。许多现代 LM 用 RMSNorm，不减均值也不加 bias，代表 Llama、PaLM、Chinchilla、T5。现代解释是它更快且质量相当：操作更少、参数更少。但大矩阵乘占绝大部分 FLOPs，因此“少算均值”本身解释不足；FLOPs 不等于运行时间，数据搬运使 RMSNorm 仍有意义，论文也观察到运行时甚至性能收益。现代 Transformer 通常还删除线性 bias，原因同样包括内存与优化稳定性。小结：基本都采用不在 residual 主路上的 norm，常为 pre-norm；有人在 residual 外加第二个 norm；多数用 RMSNorm，因为质量相当而搬运更少；也普遍去 bias，因为 compute/parameter 权衡不划算。
+
+**第 20–25 页。** activation 家族包括 ReLU、GELU、Swish、ELU、GLU、GeGLU、ReGLU、SeLU、SwiGLU、LiGLU。ReLU 代表原始 Transformer、T5、Gopher、Chinchilla、OPT；GELU 定义为 xΦ(x)，代表 GPT-1/2/3、GPT-J、GPT-NeoX、BLOOM；SwiGLU/GeGLU 代表 Llama、PaLM、T5 v1.1 及多数 2023 后模型。GLU 把原来 max(0,xW1) 改成 max(0,xW1) 与 xV 的逐元素乘积，再乘 W2，因此多一个 V。GeGLU 见于 T5 v1.1、mT5、LaMDA、Phi-3、Gemma 2/3/4；SwiGLU 的 Swish 为 x·sigmoid(x)，见于 Llama、PaLM、Mistral、OLMo 与多数新模型。gated 模型为匹配参数量把 Dff 缩为约 2/3。Shazeer 2020 与 Narang 2020 都显示 GLU 有较一致收益；它不是必要条件，GPT-3 仍工作，Nemotron 340B 甚至用 squared ReLU，但现代共识偏向 Swi/GeGLU。
+
+**第 26–29 页。** 普通 block 串行做 attention 再 MLP。GPT-J 首先采用并行层，PaLM、GPT-NeoX 也使用；正确实现可共享 LayerNorm 并融合矩阵乘，近期 Command A、Falcon 2 11B、Command R+ 亦采用。架构小结：几乎所有模型用 non-residual norm；RMSNorm 有明确计算/运行收益，有时也有性能收益；GLU 已成共识；多数新模型仍用串行层。
+
+**第 30–34 页。** 位置表示有四类：原 Transformer 的 sine/cosine 相加；GPT-1/2/3、OPT 的可学习 absolute vector 相加；T5、Gopher、Chinchilla 在 attention 中加入 relative 项；GPT-J、PaLM、Llama 与多数 2024+ 模型用 RoPE。理想相对表示应让两个位置化向量的内积只依赖内容 x,y 与 i−j。sine 相加会产生非相对交叉项，absolute 显然不是相对，传统 relative 项也不再是纯内积。内积对共同旋转不变，因此可把同一句中“we”“know”按各自位置旋转；整体平移只增加共同角度，内积保持相对差。RoPE 有多种旋转选择，标准做法把坐标两两配成 2D 并按不同频率旋转，动机来自复数；Gemma 4 有只旋转前两维的替代。实际数学用 sin/cos 相乘，不像 sine embedding 那样做加法，因此没有那些 cross term。代码先完成通常 Q/K 投影，取 RoPE cos/sin 矩阵并乘到 query/key，再做普通多头注意力；每次 attention 都施加以维持位置不变性。
+
+**第 35–40 页。** 超参数问题包括 FFN 比 hidden 大多少、多少 heads、heads 是否必须整除 hidden、vocab 多大，以及是否正则化、模型应深还是宽。FFN 常见强共识是 Dff=4D，少数例外。GLU 因多一矩阵缩 2/3，通常 Dff≈8D/3。表中 PaLM 为 4，Mistral 7B/Llama-2 70B 为 3.5，Llama 70B 与 DeepSeek 67B 为 2.68，Qwen 14B 为 2.67，Yi 34B 为 2.85，T5 v1.1 为 2.5。T5 11B 极端取 Dff=65536、D=1024，即 64 倍；近期 Gemma 2 为 8 倍，SmolLM/Gemma 3/4 的 GLU 为 4 倍。实验上 1–10 倍存在近似最优盆地。默认 4 与 GLU 的 2.66 对几乎所有现代 LM 都有效；T5 证明 64 也能工作，却不是铁律，而 T5 v1.1 回归 2.5 暗示 64 很可能次优。
+
+**第 41–45 页。** head_dim×num_heads 通常等于 model_dim，但不是数学要求。例表：GPT-3 为 96×128/12288=1；T5 为 128×128/1024=16；T5 v1.1 为 64×64/4096=1；LaMDA 为 2；PaLM 为约 1.48；Llama 2 为 1；Qwen 3.5 27B 为 1.2。多数约 1，部分 Google 模型是显著例外。深宽比 D/n_layers 也较集中：BLOOM 205、T5 v1.1 171、PaLM 156、GPT-3/OPT/Mistral/Qwen/OLMo 3 约 128、Llama 102、Gemma 3 87、Gemma 4 61、T5 11B 33。极深模型难并行且 latency 更高；Kaplan 与 Tay 的证据说明有一段宽泛可行区域。
+
+**第 46–49 页。** 单语 vocab 常为 30k–50k：原 Transformer 37k、GPT 40257、GPT-2/3 50257、T5 32128、Llama 32k。多语/生产系统常 100k–250k：mT5 250k、PaLM 256k、GPT-4 100276、Gemma 4 262144、DeepSeek 100k、Qwen 15B 152064、Yi 64k。单语不需巨大词表，多语需要。关于正则化，反对预训练 dropout 的理由是 trillions tokens 多于参数且 SGD 通常只遍历语料一轮，不易经典记忆。但实践表显示原 Transformer/GPT-2/T5/GPT-3/OPT/Qwen 用 0.1 dropout，T5 v1.1/PaLM/Llama 为 0；较老模型常用 dropout，新模型除 Qwen 外主要依赖 weight decay。论文不提 dropout 时，开放模型通常等于不用，闭源模型未必。weight decay 对 LLM 并非主要控制过拟合，而会和 cosine 学习率等优化动力学交互。
+
+**第 50–55 页。** 超参数总结：普通 FFN 4 倍、GLU 8/3 是有一定证据的标准；head 总宽等于 D 很标准但验证少；D/layers 的好范围宽约 100–200，systems 决定具体值；LLM 仍“正则化”，但效果主要体现在优化动力学。稳定训练近期很受关注，不要训练出 loss 与 gradient norm 大量尖峰的曲线。softmax 的指数和除法可能病态。输出 softmax 可加 z-loss 约束 log partition；PaLM 使用此技巧，Baichuan 2、DCLM、OLMo 2/3 也采用。attention softmax 可在进入前对 query/key 做 Layer/RMS norm；DCLM、OLMo 2/3、Gemma 2/4、Qwen 3 使用，起源包括视觉和多模态模型。还可用 tanh 把 logit 软截顶，防爆炸但可能有性能代价。
+
+**第 56–61 页。** 多数模型不大改 attention heads，主要例外是 GQA/MQA 节省推理成本、sparse/sliding window 限制模式，以及 Jamba、Falcon 3、Qwen 3.5 等 SSM 混合。并行 attention 的总算术量与内存访问可保持较高算术强度；增量生成无法并行，每步依赖上一步并维护 KV cache，算术强度差，需要大 batch、短 sequence 或较大 model dim。n/d 项难消除。MQA 保留多个 query，却只用一组 keys/values，显著减少 KV cache 的搬运；GQA 不走到单组，而用更少 KV 组，提供表达力与推理效率旋钮；DeepSeek V2 的 MLA 是更近的扩展。MQA 有时带小幅 perplexity 损失，GQA 常为低或无损。
+
+**第 62–67 页。** full context attention 的成本为平方级；sparse/structured/sliding-window attention 用表达力换运行时，GPT-3、GPT-OSS、Gemma 4 等使用。当前常见技巧是交错 full 与 local/restricted attention，例如 Command A 每四层一个 full；长程层可 NoPE，短程层用 RoPE+SWA。Llama 4、Gemma 3/4、OLMo 3、Qwen 3.5/Next 各有不同交错。结论是大型 LM 的架构和超参数大部分相同，主要差异集中于位置编码、activation 与 tokenization。
 
 ## Lecture 4：两条扩展路径
 
-### Attention alternatives
+Lecture 3 仍在标准 attention 周围做局部改良；这一讲走两条更激进的路：用递归状态或稀疏检索降低长上下文成本，用 MoE 在近似固定的每 token FLOPs 下扩大总参数容量。两者都把“稀疏”引入模型，但稀疏的对象不同：前者稀疏/压缩时间连接，后者稀疏激活参数。
 
-去掉 softmax 或把相似度核化后，结合律允许 `Q(KᵀV)`，避免显式 T×T；causal 形式可递推 `S_t=S_{t−1}+k_tv_tᵀ`、`y_t=q_tᵀS_t`。代价是状态矩阵压缩所有历史，精确内容寻址能力可能弱于 full attention。
+<TermDeck
+  title="这讲容易混淆的名词"
+  items={[
+    { term: 'SSM', expansion: 'State Space Model', chinese: '状态空间模型', explanation: '用递归状态压缩历史，并以可并行算法训练；Mamba 系列把输入依赖的门控加入状态更新。' },
+    { term: 'GDN', expansion: 'Gated DeltaNet', chinese: '门控 Delta 网络', explanation: '先沿当前 key 方向有选择地擦除旧状态，再写入新的 key-value 关联；β=0 时可以什么都不写。' },
+    { term: 'DSA', expansion: 'DeepSeek Sparse Attention', chinese: 'DeepSeek 稀疏注意力', explanation: '轻量 indexer 为每个 query 选择少量相关历史 token，再只在选中位置做 attention；可在短上下文 dense 预训练后适配。' },
+    { term: 'MoE', expansion: 'Mixture of Experts', chinese: '专家混合', explanation: '把一个 dense FFN 换成许多专家，router 每个 token 只激活 Top-K 个；总参数随专家数增加，每 token 计算增长较慢。' },
+    { term: 'EP', expansion: 'Expert Parallelism', chinese: '专家并行', explanation: '不同设备持有不同 experts，token 经 all-to-all 发到所属专家，计算后再发回；最怕负载不均与通信拥塞。' },
+    { term: 'MTP', expansion: 'Multi-Token Prediction', chinese: '多 token 预测', explanation: '训练额外轻量预测头预判更远 token；可改善训练信号，也能为 speculative decoding 提供 draft。' },
+  ]}
+/>
 
-Mamba-2、Gated DeltaNet 等给状态更新加入选择/门控；混合模型把线性层用于长程低成本记忆，间隔插入 full attention 做精确召回。评价它们不能只看渐近 O(T)：还要看并行训练、状态大小、kernel 成熟度、短序列常数和真实质量。
+### 1. 线性 attention 的关键只是重新加括号
 
-### Mixture of Experts
+标准 attention 写成：
 
-MoE 把 dense FFN 换成 E 个专家，对每 token 由 router 选 Top-K：
+$$
+\operatorname{Attn}(Q,K,V)=\rho(QK^T)V.
+$$
 
-```text
-h' = h + Σ(i in TopK) g_i(h) · Expert_i(h)
-```
+softmax ρ 使运算不能随意交换。若 ρ 是恒等映射，或用可分解 kernel feature map 近似，就能利用结合律：
 
-这样每 token 激活参数/K 个专家的计算近似不随总 E 线性增长，却增加总容量。细粒度专家提高组合数，共享专家承载通用知识。
+$$
+(QK^T)V=Q(K^TV).
+$$
 
-难点一是路由不可微/稀疏：常对被选专家权重做可微更新，router 用 softmax/噪声等近似。难点二是 collapse：少数专家拥塞、其他闲置；辅助负载均衡 loss、router bias 或 capacity factor 会改善吞吐，却可能干扰主任务。难点三是 expert parallel 的 all-to-all：token 先按专家发往不同设备，再把输出送回；负载不均直接变成 straggler。
+左式显式形成 n×n 矩阵，成本约 <code>n²d_k+n²d_v</code>；右式先形成 <code>d_k×d_v</code> 状态，约 <code>2nd_kd_v</code>。当 n 远大于 head dimension 时，这从随 n² 变为随 n 线性。
 
-Upcycling 从训练好的 dense FFN 复制/扰动成专家，节约从零训练；DeepSeekMoE 的共享+细粒度专家、MLA/MTP 属于一整套架构与系统协同，不能把单点收益脱离 recipe 归因。
+causal 情况不能把未来写进状态，但可以递推：
+
+$$
+S_t=S_{t-1}+k_tv_t^T,qquad y_t=q_t^TS_t.
+$$
+
+这揭示 attention/RNN duality：训练时可用并行块算法，推理时维护固定形状状态逐 token 更新。代价是 <code>S_t</code> 把整个历史压进有限矩阵，不再像 full attention 那样保存每个 token 的独立 K/V，因此精确内容寻址能力可能较弱。给旧状态乘固定衰减 γ 会得到 RetNet 风格更新。
+
+### 2. 从 Mamba-2 到 Gated DeltaNet：学会忘与改写
+
+Mamba-2 给状态增加输入依赖衰减，并保留直接项：
+
+$$
+S_t=\gamma_tS_{t-1}+k_tv_t^T,qquad
+y_t=q_t^TS_t+v_t^TD,qquad \gamma_t=f(x_t).
+$$
+
+γt 决定旧记忆保留多少。Gated DeltaNet 再加入写门 βt，并沿当前 key 方向擦除旧关联：
+
+$$
+S_t=\gamma_t(I-\beta_tk_tk_t^T)S_{t-1}
+  +\beta_tk_tv_t^T,qquad y_t=q_t^TS_t.
+$$
+
+直觉上，<code>(I−βkkᵀ)S</code> 先清除“当前 key 已经指向的旧 value”，再写入新 value；β=0 时不改变输入关联。它与 fast-weight programmer、test-time training 的关系都来自“模型在前向过程中更新一块快速状态”。
+
+现实模型很少完全抛弃 full attention。MiniMax M1/miniMax-Text-01 约 7 个 linear 层配 1 个 full 层；Nemotron 3、Qwen 3.5/Next 约 3:1。linear/SSM 层负责低成本长程压缩，full 层负责精确检索。现有 controlled ablation 仍不多，所以不能只看 O(n) 标称；还要比较固定状态大小、并行训练 kernel、短序列常数、真实 loss 与 downstream quality。
+
+另一条路是 DSA：先由轻量 indexer 选相关 token，再做稀疏 attention。它保留显式历史向量与内容寻址，却让索引质量成为新瓶颈；优势是可在 dense 短上下文预训练后 post-hoc 适配长上下文。
+
+### 3. MoE 的计算账：总参数不等于激活参数
+
+对 token hidden h，router 产生 logits，选集合 T(h)：
+
+$$
+y=\sum_{e\in T(h)}g_e(h)E_e(h),\qquad |T(h)|=K.
+$$
+
+若有 E 个相同宽度专家而每 token 只跑 K 个，FFN 的 **激活参数和主要矩阵乘** 约随 K 增长，总参数容量却随 E 增长。因此比较 MoE 时必须同时报告：
+
+- total parameters：权重文件与潜在容量；
+- active parameters：一次 token 前向真正使用的参数；
+- routed/shared experts 与每 token active experts；
+- training FLOPs 与推理通信，而不只写“671B”。
+
+同 FLOPs 下更多参数通常改善质量，MoE 也能更快达到目标 loss，并把专家天然分布到多设备；这解释 Mixtral、Qwen、DeepSeek 等开放模型的流行。但单机很难体现优势，多节点 infrastructure、routing objective 和稳定性更复杂。
+
+### 4. Top-K router 到底怎样有梯度
+
+绝大多数模型使用 **token-choice Top-K**：每个 token 的 router 线性层产生 E 个分数，选最高 K 个。Switch 取 K=1，GShard/Grok/Mixtral 常为 2，Qwen/DBRX 为 4，DeepSeek 某些版本为 6–8。也有 expert-choice（专家挑 token）、全局 matching、hash routing 或早期 REINFORCE 路由，但不是主流。
+
+Top-K 索引是离散的，对“没被选中的专家是否应进入集合”没有普通梯度；实践仍可对被选专家的 gate 权重与输出反传，并用 softmax/noise/balancing 提供训练信号。常见两种 gate 归一化：
+
+1. 先在全部 E 个 logits 上 softmax，再取 Top-K；
+2. 先 Top-K，再只在选中 logits 上 softmax。
+
+两者的 gate 尺度与未选专家梯度不同，读代码时必须确认顺序。Gaussian noisy gating 或 uniform multiplicative jitter 让边界附近专家偶尔被探索、减少脆弱路由；后续工作也发现 jitter 不一定需要。
+
+### 5. Fine-grained、shared 与负载均衡
+
+把一个大专家切成多个小专家称 **fine-grained experts**；若每 token 同时激活更多小块，可增加组合数。**shared experts** 对所有 token 常开，承载通用变换，routed experts 专注差异。DeepSeek 消融支持更多细粒度专家与 shared expert，OLMoE 则发现细粒度有益但 shared 没有额外收益，说明它不是无条件真理。
+
+系统要求每个设备收到近似相同 token 数，否则最拥塞专家决定 step 时间。Switch 风格辅助 loss 把 router 概率质量与实际分配频率相乘；常用形式可写：
+
+$$
+L_{balance}=\alpha E\sum_e f_e p_e,
+$$
+
+其中 fe 是发给专家 e 的 token 比例，pe 是平均 router 概率。频繁专家会收到更强下调信号。DeepSeek V1/2 同时做 expert-level 与 device-level balance；V3 为每个专家维护在线 bias，专家过载就降低 bias、空闲就提高，称 aux-loss-free balancing，但仍保留 sequence-wise auxiliary loss，所以并非完全没有辅助项。
+
+辅助 loss 的风险是为系统均衡牺牲语言建模最优；不加又会 collapse、丢 token 或让 all-to-all 出现 straggler。需要同时监控 expert load histogram、capacity/drop rate、router entropy、主 loss 与通信时间。
+
+<ExecutionTrace
+  title="一个 token 穿过 expert-parallel MoE"
+  steps={[
+    { label: '打分', title: 'router 产生 E 个 logits', input: 'h ∈ ℝᴰ', output: 'scores ∈ ℝᴱ', explanation: 'router 常用 fp32，即使专家矩阵是 bf16；这样可避免边界排序被低精度噪声放大。' },
+    { label: '路由', title: '选择 Top-K 与 gate', input: 'scores', output: 'expert IDs + weights', explanation: 'shared expert 可始终启用；routed expert 按 token 选择。' },
+    { label: '派发', title: 'all-to-all 按专家重排 token', input: '本卡 token', output: '各专家连续 token buffer', explanation: '这里是主要通信点；不均衡会让部分设备先等、部分设备过载。' },
+    { label: '计算', title: '每个专家执行 batched/sparse FFN', input: 'expert-local token blocks', output: 'expert outputs', explanation: 'MegaBlocks 等库避免为 padding 到固定 capacity 浪费大量矩阵乘。' },
+    { label: '合并', title: '反向 all-to-all 并按 gate 加权', input: 'K 个专家结果', output: 'y ∈ ℝᴰ', explanation: '恢复原 token 次序，与 residual 相加；反向传播沿同一路由返回。' },
+  ]}
+/>
+
+### 6. 系统、随机性和稳定性
+
+expert parallel 的基本通信是 dispatch all-to-all → local expert GEMM → combine all-to-all。padding 到统一 capacity 简单却浪费，MegaBlocks 用 block-sparse matrix multiplication 处理不等长专家批次。Nemotron 3 提出先下投影 activation 再通信，以更小字节数换额外投影计算。
+
+若 router 设置 capacity 并在超载时丢 token，某 token 是否保留取决于同一 batch 里还有谁被路由到该 expert；线上 continuous batching 时，别人的请求甚至会影响你的输出，形成额外非确定性。更稳的实现会避免 token drop、提高 capacity 或做无丢弃动态 shape。
+
+router logits 的数值尤其敏感：微小误差能改变 Top-K 的离散集合。课程建议 router 单独用 fp32，并可加 router z-loss 控制 log partition。稀疏 MoE 在小型 fine-tuning 数据上也更易过拟合；Zoph 等只微调 non-MoE MLP，DeepSeek 则用约 1.4M SFT 数据缓解。
+
+### 7. Upcycling 与 DeepSeek recipe
+
+Upcycling 从 dense checkpoint 初始化 MoE：复制 FFN 到多个 experts，再通过路由、噪声或微小扰动打破对称，节省从零训练。MiniCPM 用 top-2、8 experts、约 4B active 参数，在约 520B token 继续训练后超过 base；Qwen MoE 从 Qwen 1.8B 初始化，top-4、60 routed + 4 shared，是早期确认成功案例之一。
+
+DeepSeek MoE 的演进必须连同系统看：
+
+| 版本 | total / active | experts | 新增机制 |
+| --- | --- | --- | --- |
+| V1 | 16B / 2.8B | 2 shared；64/4 fine-grained，6 routed active | standard Top-K；expert+device aux balance |
+| V2 | 236B / 21B | 2 shared；160/10，6 active | Top-M device routing；收发双向通信平衡 |
+| V3 | 671B / 37B | 1 shared；约 256 routed，8 active | sigmoid/softmax Top-K；online bias + seq-wise aux |
+
+MLA 把 Q/K/V 表示成更低维 latent 的函数，KV cache 只存较小的 latent cKV，并把上投影与 query 投影合并。RoPE 会阻止某些矩阵重排，因此 MLA 保留少量非 latent key 维专门旋转。MTP 用轻量模块预测多个未来位置；DeepSeek V3 实际用一个额外 token 预测，并可为后续 draft/验证提供基础。MoE、MLA、MTP、通信策略和训练 recipe 是联合系统，不能把整模型提升归因于一个组件。
+
+### Lecture 4 PDF 中文全文（60 页，按页序）
+
+**第 1–3 页。** 标题为 Attention Alternatives and Mixtures of Experts。大 context 下 attention 成本上升，基础工具是 local+global attention 与系统工程；问题是能否取得更激进的大幅收益。
+
+**第 4–5 页。** 线性 attention 从 Q∈ℝⁿˣᵈᵏ、K∈ℝⁿˣᵈᵏ、V∈ℝⁿˣᵈᵛ 和 Attn=ρ(QKᵀ)V 出发。QKᵀ 造成 n²dk；当 ρ 为恒等时，结合律给出 (QKᵀ)V=Q(KᵀV)，把 n²dk+n²dv 变为约 2ndvdk。该观察看似简单却重要，Shen 2018、Katharopoulos 2020 的 kernel 版本以及 fast-weight programmers 都与之相关。causal 递归形式为 St=St−1+ktvtᵀ，yt=qtᵀSt；duality 允许训练用并行形式、推理用串行线性形式。若旧状态乘 γ，就得到 RetNet。
+
+**第 6–11 页。** MiniMax M1/miniMax-Text-01 使用约 7 个 linear 配 1 个 full attention，表现较强且 context scaling 线性。Mamba-2 把状态推广为输入相关 γt 衰减，加直接项 vtᵀD；门控提高线性 attention 表达力并保留 duality。Nemotron 3 使用约 3:1 Mamba/attention hybrid，偏好表现可比或更好。Gated DeltaNet 再用 βt 门控制写入，沿 kt 方向擦除旧状态；β=0 相当于 no-input operation，与 fast weights/test-time training 密切相关。Qwen 3.5/Next 也是约 3:1 GDN/attention hybrid，有合理性能与良好推理特性。controlled ablation 不多，但少量 full attention 的 hybrid 已有低 loss 证据。
+
+**第 12–13 页。** hybrid 的替代是 sparse adaptation：DSA 不注意每个 token，而由轻量 indexer 选少量位置，可显著获益，也可在 dense 短 context 预训练后 post-hoc 适配。DeepSeek V3.2 与 GLM-5 使用 DeepSeek Sparse Attention。
+
+**第 14–18 页。** 进入 MoE，讲义提到 GPT-4 可能为 MoE但未确认。MoE 用许多大 FFN 和 selector 替换一个大 FFN；增加专家数可以不按同等比例增加每 token FLOPs。同 FLOPs 下更多参数表现更好；MoE 到达目标更快，与 dense equivalent 很有竞争力，并易分布到多设备。西方最高性能开放模型中许多是 MoE，中国模型团队也在较小规模做大量工作，Qwen、DeepSeek 有早期结果与良好消融，DeepSeek V3 是近期大规模结果。
+
+**第 19–23 页。** MoE 较晚普及因为 infrastructure 复杂、优势主要在多节点，训练目标启发式且有时不稳。典型做法只把 MLP 换成 MoE；较少见做法把 attention heads 也做 MoE，例如 ModuleFormer、JetMoE。MoE 的变化维度是 routing function、expert size 与 training objectives。大多数 routing 可归结为选 Top-K：token 选 expert、expert 选 token，或全局优化路由；绝大多数实际模型采用 token-choice Top-K。
+
+**第 24–27 页。** 常见 Top-K：Switch K=1，GShard K=2，Grok/Mixtral K=2，Qwen/DBRX K=4，DeepSeek 某版本 K=7；hashing 是常见 baseline。早期工作用 RL 学 route（如 Bengio 2013），如今少见；另一些把路由写成线性分配 matching。经典 Top-K 由 logistic regressor 得 gate；DeepSeek V1/2、Grok、Qwen 使用一种归一化次序，Mixtral、DBRX、DeepSeek V3 在 Top-K 后 softmax。
+
+**第 28–34 页。** DeepSeek/Qwen 等近期变体采用更多、更小 experts，并加少量 always-on shared experts；思想最早也见于 DeepSpeed MoE。DeepSeek 消融显示更多 experts 与 shared experts 通常有益；OLMoE 消融支持 fine-grained experts，却没发现 shared experts 收益。路由表如下：GShard 2048 routed/2 active；Switch 64/1；ST-MoE 64/2；Mixtral 8/2；DBRX 16/4；Grok 8/2；DeepSeek V1 64 routed、6 active、2 shared、fine-grained ratio 1/4；Qwen 1.5 为 60/4/4、1/8；DeepSeek V3 为 256/8/1、1/14；OLMoE 64/8/0、1/8；MiniMax 32/2/0、约 1/4；Llama 4 Maverick 128/1/1、1/2。
+
+**第 35–38 页。** MoE 训练的核心矛盾是需要稀疏才高效，但 sparse gate 是不可微离散决定。候选方案是 RL、随机扰动或启发式 balancing loss；实践主要选择第三种。REINFORCE 路由能工作，但梯度方差和复杂性使收益不足以成为明确选择。Shazeer 2017 给路由加 Gaussian perturbation，使 experts 更稳健，softmax 学习 K 个专家排序。Switch 的 uniform multiplicative jitter 目标相同，后续 Zoph 2022 又移除了它。
+
+**第 39–43 页。** 系统效率要求 experts 使用均匀。Switch balancing loss 的梯度让被频繁使用 expert 得到更强下调。DeepSeek V1/2 同时做 per-expert balance 与按设备聚合的 per-device balance。V3 改为每 expert bias 在线调整，称 auxiliary-loss-free balancing，但仍不是完全没有 auxiliary loss。移除 balance loss 会出现负载问题。
+
+**第 44–47 页。** MoE 每个 FFN 可放一台设备，提供额外并行维度；但 routing 带来 token dispatch/collect 与不规则矩阵形状。MegaBlocks 用更智能 sparse matrix multiplication。Nemotron 3 提出下投影 activation 以减少通信。MoE 还有额外随机性：batch-level routing 的 token dropping 意味着同批其他查询能让你的 token 被丢弃。
+
+**第 48–51 页。** MoE 稳定性问题可通过只让 expert router 使用 fp32，并有时加 auxiliary z-loss 缓解；移除 z-loss 会恶化 router logit。稀疏 MoE 在小 fine-tuning 数据上可能过拟合；Zoph 的方案是只微调 non-MoE MLP，DeepSeek 用约 1.4M SFT 数据。另一个训练方法是 upcycling：能否用预训练 dense LM 初始化 MoE。
+
+**第 52–53 页。** MiniCPM upcycling 从 base 出发，top-2、8 experts、约 4B active，用约 520B tokens 继续训练取得提升。Qwen MoE 从 Qwen 1.8B 初始化，top-4、60 routed 与 4 shared，架构近似 DeepSeekMoE，是较早确认成功的 upcycling。
+
+**第 54–56 页。** DeepSeek MoE V1 为 16B total/2.8B active，2 shared 加 64/4 fine-grained，6 active，标准 Top-K 与 expert/device auxiliary balance。V2 为 236B/21B，2 shared 加 160/10，6 active，新增 Top-M device routing 与同时平衡通信流入/流出的 loss。V3 为 671B/37B，1 shared 加约 256 routed、8 active，新增 sigmoid+softmax Top-K、aux-loss-free online bias 与 sequence-wise auxiliary loss。
+
+**第 57–59 页。** 构成 DeepSeek V3 还需要 MLA 与 MTP。MLA 把 Q/K/V 写成较低维 latent activation 的函数；KV cache 只需保存更小的 cKV，上投影可并入 Q projection，query 也压缩以省训练显存。RoPE 与 MLA cache 的矩阵合并冲突，因为位置旋转夹在两个投影之间；解法是保留少量可旋转的 non-latent key dimensions。MTP 用小型轻量模型预测多个未来步骤，但 DeepSeek 只额外预测一个 token；讲义同时展示 EAGLE 关系并建议看论文消融。
+
+**第 60 页。** 总结：MoE 利用稀疏性，不是每个输入都需要完整模型；离散路由很难，但 Top-K 启发式实际有效；大量实证已经表明 MoE 工作且具有成本效益。
 
 ## 四讲之后你应能做的事
 

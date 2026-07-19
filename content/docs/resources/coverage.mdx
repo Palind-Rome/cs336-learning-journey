@@ -1,13 +1,13 @@
 ---
-title: 材料覆盖审计
-description: 不是“写了几篇文章”，而是逐项确认 17 讲与 5 次作业没有知识空洞。
+title: 课程索引与阶段自检
+description: 把 17 讲的核心问题连接到对应实现、作业与复习入口。
 ---
 
-## 超集的定义
+## 怎样使用这张索引
 
-本站把“内容超集”定义为：原材料每个主题/题型在站内都有可定位入口，同时额外提供先修、直觉、推导、张量形状、源码/测试证据、调试方法、实验设计和延伸阅读。它不意味着复制题面或发布可提交答案。
+先从“精读”理解公式与设计动机，再进入“实现/专题”运行代码。每完成一讲，尝试不看答案解释一个关键机制，并用最小输入验证张量形状、数值结果或系统通信量；解释不清的术语可回到[核心术语表](/docs/resources/glossary)。
 
-## 17 讲覆盖
+## 17 讲学习入口
 
 | 讲次 | 原材料主题 | 精读 | 实现/专题 |
 |---:|---|---|---|
@@ -29,7 +29,7 @@ description: 不是“写了几篇文章”，而是逐项确认 17 讲与 5 次
 | 16 | RLVR、GRPO、R1/Kimi/Qwen、agentic RL | [L15–17](/docs/lectures/15-17-alignment-multimodal) | [A5](/docs/assignments/assignment-5) |
 | 17 | CLIP/SigLIP、LLaVA/Qwen-VL、VQ-VAE | [L15–17](/docs/lectures/15-17-alignment-multimodal) | [多模态](/docs/resources/evaluation-multimodal) |
 
-## 五次作业覆盖
+## 五次作业完成标准
 
 - **A1**：Unicode、BPE、tokenizer 实验；Linear/Embedding/RMSNorm/SwiGLU/RoPE/attention/block/LM；参数与 FLOP 核算；CE/AdamW/LR/clip/data/checkpoint/训练/解码；LR、batch、norm、position、FFN、数据集与 leaderboard 消融。
 - **A2**：benchmark/Nsight/mixed precision/memory；activation checkpoint；PyTorch/Triton FlashAttention forward/backward/benchmark；collective、naive/overlap DDP；optimizer state sharding；FSDP/mixed precision/full param；ring/DP/FSDP/TP/2D 计算通信推导与 leaderboard。
@@ -37,6 +37,11 @@ description: 不是“写了几篇文章”，而是逐项确认 17 讲与 5 次
 - **A4**：WARC/WAT/WET、HTML、lang ID、PII、harmful/quality/Gopher、exact line/MinHash 去重、完整流水线、tokenization 和固定训练比较。
 - **A5**：三种 prompting、token/mask/log-prob/entropy、group advantage、aggregation/train step、GRPO constant/Dr.GRPO/RFT/MaxRL、off-policy/GSPO、多 seed；可选 packed SFT、四类评测、HH 与 DPO。
 
-## 如何发现仍有空洞
+## 阶段自检
 
-每次内容修改都按“材料项 → 精读 → 实现/测试 → 延伸”检查。若某项只有一行摘要而没有原理或可操作入口，就不算完成；若出现材料未覆盖的新说法，必须给原始论文/仓库来源或明确标为推论。
+完成每个阶段后，用下面四个问题检验是否真正掌握：
+
+1. **能解释**：不用术语堆砌，说明算法的输入、状态变化、输出与目标函数。
+2. **能实现**：从空文件写出核心路径，并用作业测试和极小手算案例验证。
+3. **能核算**：说清参数量、FLOPs、显存、通信或数据保留率从哪里来。
+4. **能诊断**：看到 loss、吞吐、reward 或评测异常时，能提出可证伪的原因与下一项检查。

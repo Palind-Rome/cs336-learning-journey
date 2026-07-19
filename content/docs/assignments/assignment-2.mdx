@@ -1,130 +1,999 @@
 ---
 title: Assignment 2 · Systems
-description: 从可信 benchmark 到 FlashAttention、DDP、状态分片与教学版 FSDP。
+description: 从可复现实验开始，完成 FlashAttention-2、异步 DDP、优化器状态分片与 FSDP，并推导并行扩展边界。
 ---
 
-## 先建立原则
+## 这一章要造什么
 
-A2 不是“让代码看起来更底层”，而是用证据回答：瓶颈是计算、内存还是通信？优化是否保持数值正确？课程附带的 `cs336-basics/` 是本作业 profiling/FSDP 使用的参考模型，不是让你回填 A1 的答案。
+A1 回答“语言模型由哪些数学部件组成”，A2 接着回答“怎样让这些部件在真实 GPU 上跑得快、装得下、扩得开”。最终交付不是某一个 kernel，而是一条完整的系统优化链：
 
-## 第一站：可信 benchmark 与 profile
+1. 写出不会被 CUDA 异步执行欺骗的 benchmark；
+2. 用 Nsight Systems 和显存快照找到真正的瓶颈；
+3. 用 activation checkpointing 交换显存与计算；
+4. 用在线 softmax 写出 FlashAttention-2 的 PyTorch oracle 与 Triton kernel；
+5. 从朴素 DDP 走到通信与反向计算重叠；
+6. 分片 AdamW 状态，再分片 Linear/Embedding 权重；
+7. 用 FLOPs、字节数与带宽推导 DP、FSDP、TP 和二维并行的扩展上限。
 
-脚本要支持 forward、forward+backward、完整 optimizer step；先 warmup，再测多次均值/标准差。CUDA 异步，计时边界必须同步。Nsight 用 NVTX 标出 forward/backward/attention，memory snapshot 区分参数、激活、梯度和 optimizer state。
+本章配套实现位于 [`examples/assignment2`](https://github.com/Palind-Rome/cs336-learning-journey/tree/main/examples/assignment2)。它已经接入原作业测试：CPU 可执行部分为 **10 passed**；4 个需要 CUDA/Triton 的测试在无 GPU 环境按官方标记跳过。FlashAttention 的纯 PyTorch 前后向、tied weights DDP、FP32/FP16 FSDP、full-parameter 重建与分片 AdamW 都经过了原测试。
 
-```text
-错误：start=time(); model(x); end=time()   # 多半只测到 enqueue
-正确：warmup → synchronize → event/time → work → synchronize → record
-```
-
-activation checkpoint 保存块边界、反向重算内部。checkpoint 越细，保存边界多；越粗，单次重算时活跃张量多。先画 lifetime，再在 xl/batch 4/seq 2048 实测题面要求的候选，不预设哪个最优。
-
-## 第二站：FlashAttention-2
-
-### 普通 oracle
-
-先写/复用普通 SDPA 和 `logsumexp` 作为小矩阵参考，再做 tiled PyTorch forward，最后转 Triton。每个 Triton program 负责一个 batch 与 query tile，只循环 key tiles。
-
-在线状态：`m`（行最大）、`l`（分母）、`O`（未归一累积），都用 FP32；新最大值出现时，用 `exp(m_old−m_new)` 重缩放旧 `l/O`。最终 `L=m+log(l)` 保存给 backward。
-
-```text
-Qi: [Bq,d]   Kj,Vj: [Bk,d]
-Sij: [Bq,Bk] m,l,L: [Bq]  Oi: [Bq,d]
-```
-
-causal 判断用全局 query/key index。当前实际 adapter 名为 `get_flashattention_autograd_function_triton`；以代码签名为准。
-
-Backward 依据 `P=exp(S−L)` 重算概率，再推 `dV=PᵀdO`、`D=rowsum(O⊙dO)`、`dS=P⊙(dP−D)`、`dQ/dK`。返回项数要与 forward 参数一致，布尔 `is_causal` 对应 `None`。
-
-<AssignmentStepper items={[
-  '普通 attention 小矩阵 oracle 正确',
-  'tiled PyTorch forward 与 LSE 正确',
-  'Triton non-causal 通过',
-  'Triton causal 与边界 tile 通过',
-  'backward 梯度在容差内',
-  'BF16/FP32、不同 S/d 的真实 benchmark 已记录'
+<TermDeck title="先把系统课的缩写读顺" items={[
+  { term: 'FLOP', expansion: 'Floating-Point Operation', chinese: '一次浮点运算', explanation: '计算工作量的单位；FLOP/s 才是设备每秒能完成多少次浮点运算。矩阵乘法中的一次乘和一次加通常计 2 FLOPs。', example: '(A,B)@(B,C) → 2ABC FLOPs' },
+  { term: 'HBM', expansion: 'High Bandwidth Memory', chinese: '高带宽显存', explanation: 'GPU 芯片外、容量较大的显存。把中间张量反复在 HBM 与片上存储之间搬运，常常比算术本身更慢。', example: 'GPU ↔ HBM' },
+  { term: 'SRAM', expansion: 'Static Random-Access Memory', chinese: '片上高速存储', explanation: '靠近计算单元、容量小但极快的存储。FlashAttention 把一个 tile 放进片上存储计算，避免把完整注意力矩阵写回 HBM。' },
+  { term: 'IO', expansion: 'Input / Output', chinese: '数据搬运', explanation: '这里主要指显存层级之间的读写，不是文件输入输出。IO-aware 算法会同时计算 FLOPs 和搬运字节。' },
+  { term: 'NVTX', expansion: 'NVIDIA Tools Extension', chinese: 'Profiler 标注范围', explanation: '给一段代码贴上可视化标签；Nsight 时间线可以据此区分 warmup、forward、attention 与 backward。', example: 'with nvtx.range("forward")' },
+  { term: 'LSE', expansion: 'Log-Sum-Exp', chinese: '对数指数和', explanation: 'L_i = log Σ_j exp(S_ij)。FlashAttention 保存每行 LSE，使反向时可以重算 P，而不用保存平方大小的注意力矩阵。' },
+  { term: 'DDP', expansion: 'Distributed Data Parallel', chinese: '分布式数据并行', explanation: '每个 rank 保存完整模型、读取不同样本；反向后平均参数梯度，因此效果等同于一台设备处理合并后的全局 batch。' },
+  { term: 'NCCL', expansion: 'NVIDIA Collective Communications Library', chinese: 'GPU 集合通信库', explanation: 'NVIDIA 为多 GPU broadcast、all-reduce、all-gather、reduce-scatter 提供的高性能后端。CPU 调试通常使用 Gloo。' },
+  { term: 'rank', expansion: 'process rank', chinese: '进程编号', explanation: '一个 process group 内的唯一整数编号。global rank 标识整个作业中的进程，local rank 标识当前机器上的进程。' },
+  { term: 'FSDP', expansion: 'Fully Sharded Data Parallel', chinese: '完全分片数据并行', explanation: '除 batch 外，还分片参数、梯度和优化器状态；计算某层前临时 all-gather 权重，梯度产生后 reduce-scatter。' },
+  { term: 'TP', expansion: 'Tensor Parallelism', chinese: '张量并行', explanation: '沿权重矩阵的输入或输出维切分一次矩阵乘法；权重占用下降，但层内激活需要 collective。' },
+  { term: 'TMA', expansion: 'Tensor Memory Accelerator', chinese: '张量内存加速器', explanation: 'Hopper 及以后架构上的异步块状搬运能力，可让数据传输与计算更好地流水。它是 leaderboard 优化项，不是基础正确性所必需。' }
 ]} />
 
-## 第三站：DDP，从同步到重叠
+## 0. 建好作业骨架与测试回路
 
-naive DDP：初始化 broadcast rank 0 参数；各 rank 处理不同数据；backward 后对非空梯度 all-reduce 并除 world size。测试还含 frozen 参数和 tied weights，按 Parameter 身份去重。
+官方仓库已经带有 A1 的 staff model，A2 的 `cs336_systems/` 则是空包。把本章实现复制进去，并让 `tests/adapters.py` 只承担“接线”职责：
 
-优化版用 `register_post_accumulate_grad_hook` 在梯度真正就绪后发起异步 all-reduce；`finish_gradient_synchronization()` 统一 wait，optimizer step 绝不能越过这个屏障。对比逐参数、flatten 一次、异步重叠三种实现，用 timeline 证明而不是凭感觉。
+```python title="tests/adapters.py"
+from cs336_systems.ddp import DistributedDataParallel
+from cs336_systems.flash_attention import FlashAttentionPyTorch, FlashAttentionTriton
+from cs336_systems.fsdp import FullyShardedDataParallel
+from cs336_systems.sharded_optimizer import ShardedOptimizer
 
-## 第四站：Optimizer state sharding
+def get_flashattention_autograd_function_pytorch():
+    return FlashAttentionPyTorch
 
-每个 rank 只让底层 AdamW 持有一部分 Parameter 的 moment；step 后由 owner broadcast 更新参数，使各模型副本重新一致。稳定 owner 规则、参数顺序、tied parameter、空 shard、`add_param_group` 和父/子 optimizer 状态接口都是测试重点。
+def get_flashattention_autograd_function_triton():
+    return FlashAttentionTriton
 
-这相当于 ZeRO-1 的教学内核：参数和梯度仍复制，只有 optimizer state 约按 world size 分片。
+def get_ddp(module):
+    return DistributedDataParallel(module)
 
-## 第五站：教学版 FSDP
+def ddp_on_after_backward(ddp_model, optimizer):
+    del optimizer
+    ddp_model.finish_gradient_synchronization()
 
-只分片 Linear/Embedding 大参数；FP32 master shard 常驻。forward 前 all-gather 完整权重（可转 compute dtype），算完释放；backward 再 gather，梯度 ready 后 reduce-scatter。Norm 等复制小参数的梯度仍需 all-reduce。
+def get_sharded_optimizer(params, optimizer_cls, **kwargs):
+    return ShardedOptimizer(params, optimizer_cls, **kwargs)
 
-必须维护两种“形状世界”：优化器看到 shard `param.data/grad`；计算临时看到 full weight。非整除 shard 要 padding，gather 后裁剪；mixed precision 下 master/optimizer 仍 FP32。`fsdp_gather_full_params` 临时重建原 shape 和原参数名，不能破坏训练状态。
+def get_fsdp(module, compute_dtype=None):
+    return FullyShardedDataParallel(module, compute_dtype)
 
-## 最后才做并行策略推导
+def fsdp_on_after_backward(fsdp_model, optimizer):
+    del optimizer
+    fsdp_model.finish_gradient_synchronization()
 
-在 FFN 上先填写每一步 local tensor shape，再数计算与通信：DP 分 batch；TP 切 hidden 维并对 activation collective；FSDP 在权重轴分片并反复 gather；2D FSDP×TP 在两条设备轴平衡通信。能重叠时取关键路径的 max，不能重叠时才相加。
+def fsdp_gather_full_params(fsdp_model):
+    return fsdp_model.gather_full_parameters()
+```
 
-## 题面逐项工作台
+每完成一站就只跑对应测试，最后再跑全套：
 
-### Profiling 与精度
+```bash
+uv run pytest -k flash_forward_pass_pytorch
+uv run pytest tests/test_ddp.py
+uv run pytest tests/test_sharded_optimizer.py
+uv run pytest tests/test_fsdp.py
+uv run pytest
+```
 
-- `benchmarking_script`：覆盖题面 small/medium/large/xl/10B 配置，forward、forward+backward、optimizer step，warmup w 次、测 n 次均值/标准差。
-- `nsys_profile`：用 NVTX 排除 warmup，分别归因 attention/forward/backward；比较 Python 计时和 GPU kernel summary。
-- `mixed_precision_accumulation`：用逐次加小数展示低精度舍入；区分低精度存储、Tensor Core 乘法与 FP32 accumulator。
-- `memory_profiling`：用 memory history/snapshot 找 forward/backward/optimizer 峰值，手算 residual 与 saved tensors 对照。BF16 autocast 不等于所有参数/梯度永久 BF16。
-- `gradient_checkpointing`：先推 checkpoint 边界与重算树，再在指定 xl、batch 4、seq 2048 实测不同 block size；题面限制“一轮重算”时不得悄悄使用无限递归。
+<AssignmentStepper items={[
+  'benchmark 能分开报告 forward、backward、optimizer 时间',
+  'PyTorch tiled FlashAttention 的 output、LSE 与梯度通过',
+  'Triton kernel 支持 causal 与 non-causal',
+  'DDP 对 frozen/tied parameter 都与全 batch baseline 一致',
+  'ShardedOptimizer 连续十步与普通 AdamW 一致',
+  'FSDP 的 FP32、FP16、梯度 shape、full params 全部通过',
+  '完成 profiler 表格、显存图和并行策略推导'
+]} />
 
-### Attention 全题链
+## 1. 先学会测量，而不是先优化
 
-`pytorch_attention` 扫 batch 8、d∈{16,32,64,128}、sequence 256→16384，记录 forward/backward/OOM；`torch_compile` 同 shape 比 compiled/uncompiled。`flash_forward` 先 tiled PyTorch 再 Triton，保存唯一 `[B,Q]` LSE；`flash_backward` 按题面公式返回 Q/K/V 梯度和 `None` causal；`flash_benchmarking` 再扫 sequence 到 65536、BF16/FP32、forward/backward/e2e。任何 OOM/速度都是本机实测，不写成普遍常数。
+### 1.1 五组模型与一个容易踩中的异步陷阱
 
-### Distributed 全题链
+题面固定词表大小 10,000、batch size 4、默认上下文 512，并给出五组配置：
 
-| 小题 | 实质 | 验收证据 |
+| 名称 | `d_model` | `d_ff` | 层数 | 头数 |
+|---|---:|---:|---:|---:|
+| small | 768 | 3,072 | 12 | 12 |
+| medium | 1,024 | 4,096 | 24 | 16 |
+| large | 1,280 | 5,120 | 36 | 20 |
+| xl | 2,560 | 10,240 | 32 | 32 |
+| 10B | 4,608 | 12,288 | 50 | 36 |
+
+调用 `torch.matmul` 时，CPU 通常只负责把 kernel 排进 CUDA 队列便继续向下执行。因此下面的 `end - start` 多半量到的是 **enqueue 时间**，而不是 GPU 完成矩阵乘法的时间：
+
+```python
+start = default_timer()
+y = model(x)
+elapsed = default_timer() - start       # 错：GPU 可能还没做完
+```
+
+计时边界必须让 CPU 等到 GPU 队列清空：
+
+```python
+torch.cuda.synchronize()
+start = default_timer()
+y = model(x)
+torch.cuda.synchronize()
+elapsed = default_timer() - start
+```
+
+warmup 同样不可省略。第一次调用可能包含 CUDA context 初始化、内存池扩容、Triton/`torch.compile` 编译、cuBLAS 算法选择与缓存填充。题目要求先跑 5 次 warmup，再对 10 次测量求均值和样本标准差。完整可运行脚本见 [`benchmark.py`](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment2/cs336_systems/benchmark.py)。核心循环如下：
+
+```python
+optimizer.zero_grad(set_to_none=True)
+torch.cuda.synchronize()
+t0 = default_timer()
+with precision_context():
+    logits = model(inputs)
+    loss = F.cross_entropy(logits.flatten(0, 1), labels.flatten())
+torch.cuda.synchronize()
+t1 = default_timer()
+
+loss.backward()
+torch.cuda.synchronize()
+t2 = default_timer()
+
+optimizer.step()
+torch.cuda.synchronize()
+t3 = default_timer()
+
+forward_seconds.append(t1 - t0)
+backward_seconds.append(t2 - t1)
+optimizer_seconds.append(t3 - t2)
+```
+
+运行示例：
+
+```bash
+uv run python -m cs336_systems.benchmark --size small --mode train \
+  --context-length 512 --warmup 5 --steps 10
+uv run python -m cs336_systems.benchmark --size xl --mode forward-backward \
+  --mixed-precision --memory-snapshot xl-2048.pickle
+```
+
+> 题目中的运行时间必须填写你所用 GPU 的实测结果。GPU 型号、PyTorch/CUDA 版本、precision、batch、sequence length、是否 compile 都应写进表头；不要把别人的 B200 数字当成本机答案。
+
+### 1.2 用 Nsight 看时间去了哪里
+
+基础命令会得到一份时间线：
+
+```bash
+uv run nsys profile -- python -m cs336_systems.benchmark --size small
+```
+
+需要函数、autograd shape、GPU 指标与调用栈时再逐项打开，避免 profiler 本身占据大量时间：
+
+```bash
+uv run nsys profile \
+  --trace=cuda,cudnn,cublas,osrt,nvtx \
+  --pytorch=functions-trace,autograd-shapes-nvtx \
+  --cudabacktrace=all --python-backtrace=cuda \
+  --gpu-metrics-devices=0 \
+  -- python -m cs336_systems.benchmark --size medium
+```
+
+用 NVTX 把 warmup 排除，并给 attention 的三个阶段命名：
+
+```python
+import torch.cuda.nvtx as nvtx
+
+with nvtx.range("measured-region"):
+    with nvtx.range("QK transpose matmul"):
+        scores = q @ k.transpose(-1, -2) * scale
+    with nvtx.range("row softmax"):
+        probabilities = torch.softmax(scores, dim=-1)
+    with nvtx.range("P V matmul"):
+        output = probabilities @ v
+```
+
+回答 `nsys_profile` 时依次做四件事：在时间线上读 forward 总时长；在 **CUDA GPU Kernel Summary** 中按累计 GPU 时间排序；用 NVTX filter 判断 kernel 属于哪段源码；最后比较 inference 与完整 AdamW step 的 kernel 占比。矩阵乘法 FLOPs 占绝大多数，并不保证它占全部墙钟时间——softmax、normalization、elementwise、随机数、内存拷贝和大量小 kernel 的 launch latency 都可能显著。
+
+### 1.3 混合精度到底混了什么
+
+`autocast` 不会永久把模型参数改成 FP16/BF16。参数和累积梯度仍可保持 FP32；矩阵乘法等适合 Tensor Core 的算子临时降精度，而 reduction/normalization/loss 等对范围敏感的算子可以保留 FP32。
+
+题面的四段累加在当前 PyTorch 上得到：
+
+| accumulator | 加数 | 结果 |
+|---|---|---:|
+| FP32 | FP32 `0.01` | 10.0001335 |
+| FP16 | FP16 `0.01` | 9.953125 |
+| FP32 | FP16 `0.01` | 10.0021362 |
+| FP32 | FP16 后显式转 FP32 | 10.0021362 |
+
+第二行误差最大，因为每一步都把新结果舍入到 FP16；后两行避免了反复低精度累加，但 `0.01` 在创建为 FP16 时已经被量化，转回 FP32 无法找回丢失的信息。
+
+对题面 `ToyModel` 使用 CUDA FP16 autocast 时：参数仍是 FP32；`fc1` 输出 FP16；LayerNorm 内部采用更安全的 FP32 路径并输出 FP32；`fc2` logits 为 FP16；常见分类 loss 为 FP32；累积到 FP32 参数上的 gradients 为 FP32。BF16 与 FP32 有相同的 8 位指数范围，因此比 FP16 不易 overflow/underflow，但尾数精度仍低，normalization 的平方、求和与方差仍应以 FP32 累积。
+
+### 1.4 读取显存时间线
+
+```python
+torch.cuda.memory._record_memory_history(max_entries=1_000_000)
+loss = train_step()
+torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+torch.cuda.memory._record_memory_history(enabled=None)
+```
+
+把快照拖到 [PyTorch Memory Visualizer](https://pytorch.org/memory_viz)。forward 期间逐层保留 saved tensors，曲线通常阶梯式上升；backward 从最后一层开始释放 residual，同时产生梯度；第一次 AdamW step 又创建一阶矩与二阶矩，因此会出现新的永久基线。
+
+xl 配置中单个 residual-stream activation 的 FP32 大小为：
+
+$$4\text{ batch}\times 2048\text{ tokens}\times2560\text{ hidden}\times4\text{ bytes}=80\text{ MiB}.$$
+
+这只是一个残差流张量。Q/K/V、SwiGLU 中间值、attention scores、每层保存的反向输入、梯度、参数与 AdamW moments 都会叠加。mixed precision 主要减少 activations 和部分临时计算；如果参数、梯度、master weights 与 optimizer states 仍为 FP32，峰值不会简单减半。
+
+## 2. Activation checkpointing：用重算换显存
+
+### 2.1 autograd 为什么保存这么多张量
+
+反向公式需要 forward 的输入或中间结果。`saved_tensors_hooks` 可以直接观察它们：
+
+```python
+total_bytes = 0
+
+def pack_hook(tensor):
+    global total_bytes
+    if not isinstance(tensor, torch.nn.Parameter):
+        total_bytes += tensor.numel() * tensor.element_size()
+    print("save", tensor.shape, tensor.dtype, tensor.grad_fn)
+    return tensor
+
+def unpack_hook(tensor):
+    print("load", tensor.shape)
+    return tensor
+
+with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
+    y = block(x)
+    y.sum().backward()
+```
+
+题面中的普通 RMSNorm 会保存多个全尺寸张量；`torch.compile` 融合后把整段当作一个 autograd 单元，只需保存输入、weight 与很小的统计量。对 xl block，题面测得单层仍约保存 3651.31 MiB，32 层线性累加会超过 114 GiB。
+
+### 2.2 `checkpoint` 的实际执行顺序
+
+<ExecutionTrace title="一次 checkpoint 的生命周期" steps={[
+  { label: 'forward', title: '只留下边界', input: 'x at block entry', output: 'block(x)', explanation: 'forward 正常给出结果，但抑制块内中间张量的长期保存；只保留重新进入这段函数所需的输入。' },
+  { label: 'reach backward', title: '反向走到这段', input: 'd output', output: 'recompute request', explanation: 'autograd 发现块内 residual 不在内存，先暂停该段真正的 backward。' },
+  { label: 'recompute', title: '重跑一次 forward', input: 'saved boundary x', output: 'temporary residuals', explanation: '用保存的边界输入重算块内值；这一次允许保存当前 backward 马上会用到的张量。' },
+  { label: 'backward', title: '消费并释放', input: 'temporary residuals + d output', output: 'd input', explanation: '完成该段反向，临时 residual 随即释放，然后继续更早的层。' }
+]} />
+
+不允许嵌套、只付出一次重算时，把 $N$ 层按每组 $k$ 层 checkpoint：长期边界约 $N/k$ 份，重算某组时临时 residual 约 $k$ 份，峰值近似 $N/k+k$，在 $k\approx\sqrt N$ 时最小。因此 32 层可先测 `k=4,6,8`，再以实际 profiler 选择。完整 helper 见 [`checkpointing.py`](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment2/cs336_systems/checkpointing.py)：
+
+```python
+def checkpoint_sequential_blocks(blocks, x, blocks_per_checkpoint):
+    for start in range(0, len(blocks), blocks_per_checkpoint):
+        group = blocks[start : start + blocks_per_checkpoint]
+
+        def run_group(value, group=group):
+            for block in group:
+                value = block(value)
+            return value
+
+        x = checkpoint(run_group, x, use_reentrant=False)
+    return x
+```
+
+若完全忽略计算代价，可以继续递归地在 checkpoint 内二分 checkpoint，使同时活跃的层数降到 $O(\log N)$，代价是 $O(N\log N)$ 量级的重复计算。实际训练不会无限递归：通信、kernel launch、RNG 状态以及重算墙钟成本都会决定更合适的粒度。
+
+## 3. FlashAttention-2：不要生成平方大小的矩阵
+
+### 3.1 普通 attention 的真正问题
+
+普通前向为：
+
+$$S=QK^T/\sqrt d,\qquad P=\operatorname{softmax}(S),\qquad O=PV.$$
+
+若 `batch=8, sequence=16384`，仅一个 head 的 FP32 `P` 就需要 $8\times16384^2\times4=8$ GiB；还没计算 backward，也没算多头和其他层。其问题不仅是容量：forward 把 `S/P` 写入 HBM，backward 又多次读回，IO 成为关键路径。
+
+先完成普通 PyTorch sweep：固定 batch 8、无 head 维，扫描 `d ∈ {16,32,64,128}` 与 `sequence ∈ {256,1024,4096,8192,16384}`，分别 warmup、100 次 forward、记录 backward 前显存并做 100 次 backward；OOM 也要作为结果写进表格。随后用 `torch.compile(vanilla_attention)` 原 shape 对照。脚本见 [`attention_benchmark.py`](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment2/cs336_systems/attention_benchmark.py)。
+
+### 3.2 在线 softmax 的三份状态
+
+对一个 query tile $Q_i$，逐个读取 key/value tile。每读到新分块 $S_i^{(j)}$，保存：
+
+- $m_i$：目前见过的每行最大值；
+- $l_i$：以当前最大值为基准的指数和；
+- $O_i$：尚未除以 $l_i$ 的输出累积。
+
+新 tile 可能把最大值从 $m_{old}$ 抬到 $m_{new}$。旧的指数都以旧最大值为零点，必须乘 $\alpha=\exp(m_{old}-m_{new})$ 才能和新指数相加：
+
+```text
+m_new = max(m_old, rowmax(S_tile))
+P_tilde = exp(S_tile - m_new)
+alpha = exp(m_old - m_new)
+l_new = alpha * l_old + rowsum(P_tilde)
+O_new = alpha * O_old + P_tilde @ V_tile
+```
+
+最后 $O_i\leftarrow O_i/l_i$，并保存 $L_i=m_i+\log l_i$。这与对完整一行做 `logsumexp` 完全相同，却从未在 HBM 中产生 `[sequence, sequence]` 张量。
+
+### 3.3 先写可读的 PyTorch oracle
+
+以下就是测试通过的核心循环；完整 autograd class 在 [`flash_attention.py`](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment2/cs336_systems/flash_attention.py)：
+
+```python
+for query_start in range(0, n_queries, query_tile_size):
+    query = q[:, query_start : query_start + query_tile_size]
+    m = torch.full((batch, query.shape[1]), -torch.inf,
+                   device=q.device, dtype=torch.float32)
+    l = torch.zeros_like(m)
+    o = torch.zeros(batch, query.shape[1], v.shape[-1],
+                    device=q.device, dtype=torch.float32)
+
+    for key_start in range(0, n_keys, key_tile_size):
+        key = k[:, key_start : key_start + key_tile_size]
+        value = v[:, key_start : key_start + key_tile_size]
+        scores = (query @ key.transpose(-1, -2)).float() * scale
+        if is_causal:
+            qi = torch.arange(query_start, query_start + query.shape[1],
+                              device=q.device)[:, None]
+            kj = torch.arange(key_start, key_start + key.shape[1],
+                              device=q.device)[None, :]
+            scores = scores.masked_fill(~(qi >= kj), -1e6)
+
+        m_new = torch.maximum(m, scores.amax(dim=-1))
+        alpha = torch.exp(m - m_new)
+        p_tilde = torch.exp(scores - m_new.unsqueeze(-1))
+        l = alpha * l + p_tilde.sum(dim=-1)
+        o = alpha.unsqueeze(-1) * o + p_tilde @ value.float()
+        m = m_new
+
+    output[:, query_start : query_start + query.shape[1]] = (o / l[..., None]).to(q.dtype)
+    logsumexp[:, query_start : query_start + query.shape[1]] = m + torch.log(l)
+```
+
+forward 必须 `ctx.save_for_backward(q, k, v, output, logsumexp)`。官方测试会直接检查 saved tensors：形状 `[batch, queries]` 的张量必须恰好有一个，它就是 LSE。
+
+### 3.4 把 oracle 变成一个 Triton kernel
+
+一个 program instance 只负责 `(query_tile_index, batch_index)`；Q tile 常驻片上，循环 K/V tiles。tile state 均用 FP32，点积前再把概率转成 V 的 dtype。核心 kernel 如下：
+
+```python
+@triton.jit
+def flash_fwd_kernel(
+    Q, K, V, O, L,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    NQ, NK, scale,
+    D: tl.constexpr, BQ: tl.constexpr, BK: tl.constexpr,
+    is_causal: tl.constexpr,
+):
+    qi = tl.program_id(0)
+    batch = tl.program_id(1)
+    q_start = qi * BQ
+    # Q/K/V/O/L block pointers按各自 shape、stride、offset 建立；
+    # 完整参数和 boundary_check 见配套源码。
+    q = tl.load(q_block, boundary_check=(0, 1), padding_option="zero")
+    m = tl.full((BQ,), -float("inf"), tl.float32)
+    l = tl.zeros((BQ,), tl.float32)
+    acc = tl.zeros((BQ, D), tl.float32)
+    query_index = q_start + tl.arange(0, BQ)
+
+    for key_start in range(0, NK, BK):
+        k = tl.load(k_block, boundary_check=(0, 1), padding_option="zero")
+        v = tl.load(v_block, boundary_check=(0, 1), padding_option="zero")
+        s = tl.dot(q, tl.trans(k)) * scale
+        key_index = key_start + tl.arange(0, BK)
+        valid = (query_index[:, None] < NQ) & (key_index[None, :] < NK)
+        if is_causal:
+            valid &= query_index[:, None] >= key_index[None, :]
+        s = tl.where(valid, s, -1e6)
+
+        m_new = tl.maximum(m, tl.max(s, axis=1))
+        alpha = tl.exp(m - m_new)
+        p = tl.exp(s - m_new[:, None])
+        l = l * alpha + tl.sum(p, axis=1)
+        acc *= alpha[:, None]
+        acc = tl.dot(p.to(v.dtype), v, acc=acc)
+        m = m_new
+        k_block = k_block.advance((BK, 0))
+        v_block = v_block.advance((BK, 0))
+
+    tl.store(o_block, (acc / l[:, None]).to(o_block.type.element_ty),
+             boundary_check=(0, 1))
+    tl.store(l_block, m + tl.log(l), boundary_check=(0,))
+```
+
+launch grid 是 `(ceil_div(NQ, BQ), batch)`，不是 sequence × sequence。调试顺序应固定为：无 mask 小矩阵 → 比较 output → 比较 LSE → causal 对角 tile → 非整除边界 → BF16/FP32。
+
+### 3.5 backward：重算 P，而不是保存 P
+
+保存 $Q,K,V,O,L$ 后，反向先算：
+
+$$D_i=\sum_d O_{id}\,dO_{id},\qquad P_{ij}=\exp(S_{ij}-L_i).$$
+
+再依次计算：
+
+```python
+scores = q @ k.transpose(-1, -2) * scale
+scores = scores.masked_fill(~causal_mask, -1e6) if is_causal else scores
+probabilities = torch.exp(scores - logsumexp.unsqueeze(-1))
+D = (output * grad_output).sum(dim=-1, keepdim=True)
+
+grad_v = probabilities.transpose(-1, -2) @ grad_output
+grad_p = grad_output @ v.transpose(-1, -2)
+grad_s = probabilities * (grad_p - D)
+grad_q = grad_s @ k * scale
+grad_k = grad_s.transpose(-1, -2) @ q * scale
+return grad_q, grad_k, grad_v, None
+```
+
+`None` 对应 forward 的布尔参数 `is_causal`。题面基础要求允许这段使用 PyTorch/`torch.compile`；可选项才是把 backward 也写成两个 Triton pass：一个 query-major 算 `dQ`，一个 key-major 算 `dK/dV`，从而避免跨 program atomics。
+
+## 4. DDP：从“反向后通信”到边算边通信
+
+### 4.1 四个 collective 不要混
+
+| collective | 每个 rank 开始时 | 每个 rank 结束时 |
 |---|---|---|
-| communication single node | 1MB→1GB、2/4/6 GPU NCCL collective | warmup、同步、各 rank 时间 |
-| naive DDP | init broadcast + backward 后平均 all-reduce | 与全 batch 单进程、tied/frozen 等价 |
-| flat DDP | flatten 一次 collective | latency 与额外 copy 的实测 |
-| overlap DDP | post-accumulate hook + async handle | Nsight 显示通信与 backward 重叠 |
-| state sharding | owner rank 更新 Adam state、广播参数 | 10 steps 与 baseline 对齐 |
-| FSDP | Linear/Embedding shard、两次 gather、grad reduce-scatter | FP32/mixed precision、full params 与 baseline |
+| `broadcast` | 只有 source 有权威值 | 所有 rank 得到 source 的值 |
+| `all_reduce` | 每个 rank 有完整同形张量 | 每个 rank 得到逐元素 reduction 的完整张量 |
+| `all_gather` | 每个 rank 有一个 shard | 每个 rank 拼出所有 shards |
+| `reduce_scatter` | 每个 rank 有完整张量 | 先 reduction，再让每个 rank 留一个 shard |
 
-### 书面并行推导怎么做
+最小 DDP 的一轮是：rank 0 参数 broadcast → 每个 rank 读不相交数据 → 本地 forward/backward → 参数梯度 all-reduce 并除 `world_size` → 各自执行相同 optimizer step。只要初始参数和平均梯度相同，各副本就会一直相同。
 
-`alternate_ring_all_reduce` 先画每一步“谁持有哪个 chunk”，分别数 latency step 与每设备传输 bytes；不要把整 tensor 环传与 reduce-scatter+all-gather 混成一个公式。
+### 4.2 为什么 hook 要选 post-accumulate
 
-`data_parallel_calcs / fsdp_calcs / tp_calcs / fsdp_tp_calcs` 都从同一个 SwiGLU FFN 开始：为输入、W1/W2/W3、中间激活、dX、dW 写每设备 shape；用矩阵 FLOPs 除设备算力得 compute time，用 collective bytes/带宽加 latency 得 communication time。DP 只切 B；FSDP 沿权重 shard 且前后向 gather；TP 切 Dff/D 并对 activation 做 collective；二维设备网格的两轴通信可重叠才取 max，否则相加。最终找平衡点，而不是默认 GPU 越多越快。
+普通 backward 从输出层向输入层推进。某个参数的梯度一旦累积完成，就可以立刻通信，同时 GPU 继续计算更早层的梯度。`register_post_accumulate_grad_hook` 的回调参数是 **Parameter 本身**，不是一个独立 grad tensor：
 
-leaderboard 的长上下文、大词表、两 B200 完整 step 同时受 attention、lm-head CE、AdamW 和 activation memory 影响。优化候选包括 fused CE、fused optimizer、causal tile early exit、activation checkpoint 与更完整 Triton backward；每项都要和端到端正确 baseline 对比。
+```python
+class DistributedDataParallel(nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+        self.world_size = dist.get_world_size()
+        self.pending = []
 
-## 测试与阅读入口
+        for parameter in self.module.parameters():
+            dist.broadcast(parameter.data, src=0)
+        for buffer in self.module.buffers():
+            dist.broadcast(buffer.data, src=0)
 
-### `tests/adapters.py` 完整契约表
+        for parameter in self.module.parameters():
+            if parameter.requires_grad:
+                parameter.register_post_accumulate_grad_hook(self._sync)
 
-| Adapter | 契约重点 |
-|---|---|
-| `get_flashattention_autograd_function_pytorch` | 返回 `torch.autograd.Function` 类；tiled forward 保存 LSE/Q/K/V/O，backward 返回含 causal 的匹配项数 |
-| `get_flashattention_autograd_function_triton` | Triton forward 支持 causal/non-causal；FP32 online state，输出/梯度与 oracle 在容差内 |
-| `get_ddp` | wrapper 暴露 `.module`；init broadcast、tied/frozen 参数安全 |
-| `ddp_on_after_backward` | 调用最终同步屏障，等待所有 async all-reduce handle |
-| `get_sharded_optimizer` | owner 稳定、local optimizer state、step 后参数广播、动态 param group |
-| `get_fsdp` | Linear/Embedding shard；`compute_dtype` 可选，FP32 master 与 replicated norm 正确 |
-| `fsdp_on_after_backward` | 完成 reduce-scatter/all-reduce 和异步等待 |
-| `fsdp_gather_full_params` | 临时重建原名/原 shape 的 full state，不改变 shard 训练状态 |
+    def _sync(self, parameter):
+        if parameter.grad is None:
+            return
+        parameter.grad.div_(self.world_size)
+        self.pending.append(dist.all_reduce(parameter.grad, async_op=True))
 
-这些入口的返回类型和调用时机比 PDF 中的自然语言更精确；先让 adapter 只做连接，再在独立模块实现系统逻辑。
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
 
-- [A2 官方仓库](https://github.com/stanford-cs336/assignment2-systems)
-- [`test_attention.py`](https://github.com/stanford-cs336/assignment2-systems/blob/main/tests/test_attention.py)
-- [`test_ddp.py`](https://github.com/stanford-cs336/assignment2-systems/blob/main/tests/test_ddp.py)
-- [`test_sharded_optimizer.py`](https://github.com/stanford-cs336/assignment2-systems/blob/main/tests/test_sharded_optimizer.py)
-- [`test_fsdp.py`](https://github.com/stanford-cs336/assignment2-systems/blob/main/tests/test_fsdp.py)
-- [PyTorch distributed collectives](https://docs.pytorch.org/docs/stable/distributed.html)、[Triton tutorials](https://triton-lang.org/main/getting-started/tutorials/index.html)
+    def finish_gradient_synchronization(self):
+        for work in self.pending:
+            work.wait()
+        self.pending.clear()
+```
+
+训练循环中 `finish_gradient_synchronization()` 必须位于 `loss.backward()` 与 `optimizer.step()` 之间。`async_op=True` 返回只说明请求已发起；不 `wait()` 就让 optimizer 读取 gradient，会形成数据竞争。
+
+官方测试还有两个细节：frozen parameter 也要在初始化 broadcast，只是不能注册 grad hook；tied weights 必须按 Parameter 身份只处理一次，`module.parameters()` 默认已去重。完整实现见 [`ddp.py`](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment2/cs336_systems/ddp.py)。
+
+### 4.3 三种 DDP 怎么比较
+
+1. **逐参数、backward 后同步**：调用多、不能重叠，是基线；
+2. **flatten 后一次 all-reduce**：减少 collective latency，但需要额外 flatten/unflatten，且必须等所有梯度完成；
+3. **逐参数异步 overlap**：调用多，但通信能藏在 backward compute 后面。
+
+用相同机器、xl、2 GPU、相同 batch/sequence/precision 做 warmup 与多次测量，并用 Nsight 截图证明时间线是否真的重叠。只报告“通信函数花了多久”不够，因为异步通信的独占时长与它对关键路径的增量不是同一个量。
+
+## 5. Optimizer state sharding：先分最占内存的 moments
+
+AdamW 为每个参数保存 `m` 和 `v` 两个 FP32 张量；加上参数、梯度，常驻内存很快超过权重本身。教学版状态分片让每个 parameter 有唯一 owner，只有 owner 的本地 AdamW 保存该参数的 moments；step 后 owner broadcast 新参数。
+
+```python
+class ShardedOptimizer(Optimizer):
+    def __init__(self, params, optimizer_cls, **kwargs):
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+        self.optimizer_cls = optimizer_cls
+        self.local_optimizer = None
+        self.owners = []
+        self.rank_loads = [0] * self.world_size
+        self.local_groups = []
+        super().__init__(params, defaults=kwargs)  # 会调用 add_param_group
+        groups = [g for g in self.local_groups if g['params']]
+        self.local_optimizer = optimizer_cls(groups, **kwargs)
+
+    def add_param_group(self, group):
+        group = {**group, 'params': list(group['params'])}
+        super().add_param_group(group)
+        local = {k: v for k, v in group.items() if k != 'params'}
+        local['params'] = []
+        for parameter in group['params']:
+            owner = min(range(self.world_size), key=self.rank_loads.__getitem__)
+            self.rank_loads[owner] += parameter.numel()
+            self.owners.append((parameter, owner))
+            if owner == self.rank:
+                local['params'].append(parameter)
+        self.local_groups.append(local)
+
+    @torch.no_grad()
+    def step(self, closure=None, **kwargs):
+        loss = self.local_optimizer.step(closure=closure, **kwargs)
+        for parameter, owner in self.owners:
+            dist.broadcast(parameter.data, src=owner)
+        return loss
+
+    def zero_grad(self, set_to_none=True):
+        super().zero_grad(set_to_none=set_to_none)  # 清所有复制参数的 grad
+```
+
+完整实现见 [`sharded_optimizer.py`](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment2/cs336_systems/sharded_optimizer.py)。使用贪心 `numel` 负载均衡比简单轮询更接近均匀 state bytes；所有 rank 必须以同一参数顺序作出同一 owner 决定。
+
+它抓住了 ZeRO stage 1 的核心——优化器状态分片——但通信实现更直白：每个 owner 逐参数 broadcast。成熟 ZeRO-1 通常把更新后参数组织成更高效的 collective/bucket，并处理更完整的 mixed precision、checkpoint 与容错状态。
+
+## 6. FSDP：计算时完整，常驻时分片
+
+### 6.1 三种形状同时存在
+
+以一个不能整除 world size 的 `[100, 64]` embedding 为例：
+
+```text
+原参数：6400 elements
+world_size=3 → shard_size=ceil(6400/3)=2134
+padding 后：6402 elements
+rank 0/1/2 常驻：各 2134 elements
+all-gather：临时 6402 → 裁掉 2 个 padding → reshape [100,64]
+```
+
+优化器永远只看 FP32 master shard；计算临时看 full weight（可在通信前转为 FP16/BF16）；full parameter 导出则用 master shards gather，不能混入 compute dtype 的量化结果。
+
+### 6.2 用 custom autograd function 真正释放 full weight
+
+只在 forward hook 中把 `parameter.data` 换成 full weight 看似简单，却会让 autograd 的 leaf shape、optimizer 引用和 backward 累积互相冲突。本章实现给 Linear/Embedding 换成 custom autograd function：
+
+<ExecutionTrace title="一个 FSDP Linear 的完整生命线" steps={[
+  { label: 'resident', title: '只保存 master shard', input: 'FP32 shard on each rank', output: 'optimizer-visible Parameter', explanation: 'optimizer 的 parameter 和 grad shape 始终是 shard shape；AdamW moments 也只按 shard 分配。' },
+  { label: 'forward gather', title: '临时拼完整权重', input: 'all FP32 shards', output: 'full compute-dtype weight', explanation: '可先把 shard 转 BF16/FP16 再 all-gather，从而减少带宽；完成 matmul 后不把 full weight 存进 ctx。' },
+  { label: 'backward gather', title: '为 dInput 再拼一次', input: 'same master shards', output: 'full compute-dtype weight', explanation: '重建 full weight 计算 dInput 与 full dWeight；这就是用额外通信/计算换常驻显存。' },
+  { label: 'grad shard', title: '平均并只留本 rank', input: 'full dWeight on every rank', output: 'FP32 local grad shard', explanation: '示例为兼容 Gloo 使用异步 all-reduce 后切片；生产实现通常直接 reduce-scatter，并用 prefetch 隐藏通信。' },
+  { label: 'step', title: '只更新 shard', input: 'master shard + local grad shard', output: 'new master shard', explanation: '下一层/下一步再次 all-gather 时，各 rank 的新 shards 共同组成新完整权重。' }
+]} />
+
+Linear 的 forward/backward 公式实现如下：
+
+```python
+class ShardedLinearFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, shard, owner, metadata):
+        full_weight = owner.gather_for_compute(shard, metadata)
+        ctx.save_for_backward(x, shard)      # 不保存 full_weight
+        ctx.owner = owner
+        ctx.shard_metadata = metadata
+        return torch.einsum('...i,oi->...o', x, full_weight)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, shard = ctx.saved_tensors
+        metadata = ctx.shard_metadata
+        full_weight = ctx.owner.gather_for_compute(shard, metadata)
+        grad_x = torch.einsum('...o,oi->...i', grad_output, full_weight)
+        full_grad_weight = torch.einsum('...o,...i->oi', grad_output, x)
+        placeholder = ctx.owner.queue_sharded_gradient(
+            metadata, full_grad_weight.to(shard.dtype)
+        )
+        return grad_x, placeholder, None, None
+```
+
+Embedding backward 则创建 `[vocab, d]` 的临时梯度，用 `index_add_` 把每次 token lookup 的 `grad_output` 累加到对应行，再进行 gradient collective。
+
+### 6.3 异步 gradient 与最终屏障
+
+custom backward 发起异步 collective 后，先向 autograd 返回一个 shard-shape 的零 placeholder；owner 保存 `(work, padded_full_grad, metadata)`。`finish_gradient_synchronization()` 等待后切出本 rank 区间，并加到 `parameter.grad`：
+
+```python
+def finish_gradient_synchronization(self):
+    for work in self.pending_replicated:
+        work.wait()
+
+    for work, padded_gradient, meta in self.pending_sharded:
+        work.wait()
+        start = self.rank * meta.shard_size
+        local = padded_gradient[start : start + meta.shard_size]
+        if meta.parameter.grad is None:
+            meta.parameter.grad = local.clone()
+        else:
+            meta.parameter.grad.add_(local)
+```
+
+RMSNorm 等小参数没有分片，因此 post-accumulate hook 对它们执行平均 all-reduce。完整、可测试实现见 [`fsdp.py`](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment2/cs336_systems/fsdp.py)。教学实现以跨平台可测为先，gradient 路径用 all-reduce 后取 shard；在 NCCL 训练中应替换为原生 reduce-scatter，并为“当前层往前两层”安排 all-gather prefetch，才能把通信藏在 compute 后面。
+
+## 7. 把通信量推到纸面上
+
+### 7.1 ring collectives
+
+设总 tensor 大小为 $S$ bytes，设备数 $N$，每设备 egress bandwidth 为 $W$ bytes/s：
+
+$$T_{all\text{-}gather}=T_{reduce\text{-}scatter}=\frac{N-1}{N}\frac{S}{W}.$$
+
+ring all-reduce = reduce-scatter + all-gather：
+
+$$T_{all\text{-}reduce}=2\frac{N-1}{N}\frac{S}{W}.$$
+
+题目的 alternate 算法每一轮都传 **完整 $S$ bytes**，共 $N-1$ 轮，所以：
+
+$$T_{alternate}=(N-1)\frac{S}{W},$$
+
+它没有先把 tensor 切成 $N$ 个 chunk，设备数增大时远差于标准 ring all-reduce。
+
+### 7.2 SwiGLU FFN 的基准账本
+
+令输入 `x:[B,D]`，`W1/W2:[D,Dff]`，`W3:[Dff,D]`。忽略 elementwise：
+
+- forward 三次 matmul：$6BDD_{FF}$ FLOPs；
+- backward 的 `dz` 一次、`dx` 两次、三个 `dW`：$12BDD_{FF}$ FLOPs；
+- 三个 FP16 权重或梯度共 $3DD_{FF}\times2=6DD_{FF}$ bytes。
+
+### 7.3 DP
+
+每设备 backward compute：
+
+$$T_{comp}=\frac{12BDD_{FF}}{N_{DP}C}.$$
+
+梯度 ring all-reduce：
+
+$$T_{comm}=2\frac{N_{DP}-1}{N_{DP}}\frac{6DD_{FF}}{W}.$$
+
+让通信不超过计算并约去公共项：
+
+$$N_{DP}\le 1+\frac{BW}{C}.$$
+
+因此 DP 的扩展上限受全局 batch tokens 控制；增大模型 hidden 并不会改变这条简化不等式，因为计算和梯度通信都同样乘了 $DD_{FF}$。
+
+### 7.4 FSDP
+
+forward 先 all-gather 权重，backward 既 all-gather 权重又 reduce-scatter 梯度：
+
+$$T^{fwd}_{comp}=\frac{6BDD_{FF}}{N_{FSDP}C},\quad
+T^{fwd}_{comm}=\frac{N_{FSDP}-1}{N_{FSDP}}\frac{6DD_{FF}}W,$$
+
+$$T^{bwd}_{comp}=\frac{12BDD_{FF}}{N_{FSDP}C},\quad
+T^{bwd}_{comm}=2\frac{N_{FSDP}-1}{N_{FSDP}}\frac{6DD_{FF}}W.$$
+
+两边都得到 $N_{FSDP}\le1+BW/C$。FSDP 省显存，却比普通 DP 在 forward 多了权重通信；能否提前 prefetch 并覆盖它决定实际吞吐。
+
+### 7.5 TP
+
+令 `W1/W2` 沿输出维 column-parallel，`W3` 沿输入维 row-parallel。每个 rank 的 backward 为：
+
+```text
+dz_i  = dy @ W3_i.T
+dx2_i = dz_i * f(x1_i)
+dx1_i = dz_i * f'(x1_i) * x2_i
+partial_dx_i = dx1_i @ W1_i.T + dx2_i @ W2_i.T
+dx = all_reduce(partial_dx_i)
+dW3_i = z_i.T @ dy
+dW2_i = x.T @ dx2_i
+dW1_i = x.T @ dx1_i
+```
+
+forward 和 backward 各有一次 `[B,D]` FP16 activation all-reduce。forward 的非通信瓶颈条件：
+
+$$N_{TP}\le1+\frac{3D_{FF}W}{2C},$$
+
+backward 则为：
+
+$$N_{TP}\le1+\frac{3D_{FF}W}{C}.$$
+
+TP 上限受 hidden/FFN 宽度控制，而非 batch；这就是它与 DP/FSDP 互补的原因。
+
+### 7.6 二维 FSDP × TP
+
+设备坐标为 `(tp_rank, fsdp_rank)`，总数 $N=N_{TP}N_{FSDP}$。forward compute 为：
+
+$$T_{comp}=\frac{6BDD_{FF}}{N_{TP}N_{FSDP}C}.$$
+
+FSDP 轴只搬运当前 TP shard 的权重，TP 轴只搬运当前 FSDP batch shard 的 activation：
+
+$$T_{FSDP}=\frac{N_{FSDP}-1}{N_{FSDP}}\frac{6DD_{FF}}{N_{TP}W},$$
+
+$$T_{TP}=2\frac{N_{TP}-1}{N_{TP}}\frac{2BD}{N_{FSDP}W}.$$
+
+若两条网络轴可以重叠，通信关键路径是 `max(T_FSDP, T_TP)`，可分别把两轴推到：
+
+$$N_{FSDP}\le1+\frac{BW}{C},\qquad
+N_{TP}\le1+\frac{3D_{FF}W}{2C}.$$
+
+若共享网络、不能重叠，必须用 `T_FSDP + T_TP`。忽略有限 $N$ 的 `-1`，最优点把通信预算一半给每条轴：$N_{FSDP}\approx BW/(2C)$、$N_{TP}\approx3D_{FF}W/(4C)$，因此：
+
+$$N\lesssim\frac{3}{8}BD_{FF}\left(\frac WC\right)^2.$$
+
+这些公式的可运行计算器在 [`parallelism.py`](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment2/cs336_systems/parallelism.py)。
+
+## 8. 实验表与 leaderboard 怎么完成
+
+单节点 collective 脚本见 [`communication_benchmark.py`](https://github.com/Palind-Rome/cs336-learning-journey/blob/main/examples/assignment2/cs336_systems/communication_benchmark.py)，扫描 1 MB、10 MB、100 MB、1 GB 与 2/4/6 GPU。NCCL 即使 `async_op=False` 也只保证 CUDA operation 已排队，计时末尾仍须 `torch.cuda.synchronize()`；不同 rank 的测量用 `all_gather_object` 汇总。
+
+建议报告表统一含：硬件、world size、backend、dtype、shape、warmup、repetitions、mean、std、peak memory、OOM。图表由 pandas 自动生成，避免手抄数字。
+
+leaderboard 的 8B、batch 2、sequence 32768、vocab 151936 在两张 B200 上做完整 AdamW step。仅优化 attention 仍可能被 `[batch, sequence, vocab]` logits、cross entropy、optimizer 和 activations 卡住。按收益/风险排序：
+
+1. fused LM head + cross entropy，避免完整 logits 常驻；
+2. 更完整的 Triton FlashAttention backward；
+3. causal tile 提前退出与 diagonal/non-diagonal 分路；
+4. fused AdamW；
+5. 只在确有 OOM 时加入 activation checkpointing；
+6. 有限配置的 autotune，确保空 cache 后 10 分钟内完成。
+
+无论用什么技巧，BF16 causal 输出与梯度必须先通过同一 oracle；速度结果才有意义。
+
+---
+
+## 作业文档完整中文译文
+
+下面按原文顺序收录 Assignment 2 v26.1.3 的中文译文。命令、接口名、公式编号与配置值保持原样，便于和 PDF 逐项对照。
+
+### 1. 作业概览（原文第 1 页）
+
+在本作业中，你将亲手体验如何提高单 GPU 训练速度，以及如何把训练扩展到多张 GPU。
+
+你将实现六项内容：benchmark 与 profiling 基础设施、activation checkpointing、FlashAttention-2 Triton kernel、distributed data parallel training、optimizer state sharding，以及 fully sharded data parallel training。
+
+作业代码和本文档位于 [assignment2-systems 官方仓库](https://github.com/stanford-cs336/assignment2-systems)。请使用 Git clone；若课程发布更新，工作人员会通知你，此时可以用 `git pull` 取得最新版本。
+
+仓库的 `cs336-basics/` 包含 A1 的 staff solution，因为本作业要 profile A1 中构建的组件。若想使用自己的模型，可以修改根目录 `pyproject.toml`，让它指向自己的包。根目录是 `cs336-systems` 的基目录，其中预先创建了空的 `cs336_systems` module，你可以从头组织实现。`tests/*.py` 包含必须通过的测试；测试通过 `tests/adapters.py` 中的 hooks 调用代码。增加测试或临时修改测试有助于调试，但最终实现必须通过原始测试。`README.md` 说明期望的目录结构和环境安装方法。
+
+提交到 Gradescope 的文件有两个：排版后的 `writeup.pdf`，回答所有书面题；以及包含你所写代码的 `code.zip`。运行 `test_and_make_submission.sh` 生成 zip。
+
+### 2. Profiling 与 benchmarking（原文第 2–9 页）
+
+本部分研究怎样优化 Transformer，使其更充分地使用 GPU。先 profile 模型，理解 forward/backward 把时间和显存花在哪里；然后用自定义 GPU kernel 优化 self-attention，使它超过普通 PyTorch 写法。之后的部分会使用多张 GPU，并理解怎样跨集群训练。
+
+#### 2.1 Profiling
+
+任何优化之前都应先 profile 程序，确认资源消耗位置。否则可能优化一个几乎不占时间或内存的部分，端到端结果便没有可测改善。本作业使用三条性能评估路径：Python 标准库的端到端 forward/backward benchmark；NVIDIA Nsight Systems 的 CPU/GPU compute profiling；以及 memory profiling。
+
+##### 2.1.1 导入 basics Transformer
+
+A1 已把模型做成 Python package，因而可以在后续作业导入。本仓库的 `./cs336-basics` 是 reference implementation，根 `pyproject.toml` 已指向它。照常执行 `uv run [command]`，uv 会自动定位这个本地包；若要使用自己的实现，修改路径即可。执行 `uv run python` 后 `import cs336_basics` 应成功，`model.py` 可通过 `import cs336_basics.model` 导入。
+
+##### 2.1.2 模型尺寸
+
+为了观察规模变化，benchmark 使用正文表 1 的 small、medium、large、xl、10B 配置。除 leaderboard 外，词表设为 10,000，batch size 设为 4，上下文长度按实验变化，未注明时使用 512。本作业和后续作业需要大量表格与图；建议用代码自动构表，例如 `pandas.DataFrame.to_latex()`、`to_typst()` 或自己的 formatter，因为在 LaTeX/Typst 中手工排大表很繁琐。
+
+##### 2.1.3 端到端 benchmark
+
+先写简单评估脚本。后续会改变 precision、替换 layer，因此应把这些变化做成命令行参数。脚本需要：按超参数初始化模型；生成随机 batch；先执行 $w$ 个 warmup step，再对 $n$ 个 step 计时；按参数选择 forward-only、forward+backward 或加 optimizer step；使用 `timeit` 或 `timeit.default_timer()` 这样的高精度时钟；每个 step 后调用 `torch.cuda.synchronize()`。
+
+性能测量很微妙。CUDA 调用是异步的：调用 `torch.matmul` 会发起 CUDA kernel，但 PyTorch 函数在矩阵乘法结束前就把控制权交还 CPU。CPU 因此可以继续排后续工作，这是重要的性能优势；但直接测 Python 调用返回时间并不是 GPU runtime。`torch.cuda.synchronize()` 会等待已安排的 GPU kernels 完成，让 CPU runtime 与 GPU runtime 同步，从而得到更准确的时间。
+
+`benchmarking_script` 题要求提交上述脚本。随后对表 1 每种模型，以 5 次 warmup、10 次测量报告均值和标准差，回答 forward、backward 各花多久以及波动是否大。再去掉 warmup 重测，解释结果为何变化；也尝试 1 或 2 次 warmup，解释为什么仍可能不同。
+
+##### 2.1.4 Nsight Systems
+
+端到端 benchmark 不能告诉我们时间和内存具体属于哪个 component。execution profiler 会在函数开始/结束处插入 instrumentation，从而给出调用次数、平均时长与累计时长等函数级统计。普通 Python profiler 如 cProfile 无法正确覆盖异步 CUDA kernels；NVIDIA 提供了 CLI 工具 `nsys`。
+
+在上一节脚本前加 `nsys profile --` 即可生成 profile，例如 `uv run nsys profile -- python benchmark.py`。然后在本机 Nsight Systems GUI 打开结果；选中 CUDA API 行中的 CPU 调用，会高亮 CUDA HW 行中对应的 GPU kernel。
+
+更全面的命令可加入 `--trace=cuda,cudnn,cublas,osrt,nvtx`、`--pytorch=functions-trace,autograd-shapes-nvtx`、CUDA/Python backtrace 与 GPU metrics。`--trace` 指定记录的 API；`--pytorch` 加入 module 和 autograd 的 NVTX labels；backtrace flags 帮助追溯 kernel 源码；`--gpu-metrics-devices=0` 指定测量哪张 GPU。profiling 不是免费的，会使运行变慢；只开启当前问题需要的功能。尤其在不需要 traceback 时移除两个 backtrace flag，它们的额外开销很大。
+
+可以给代码加 NVTX ranges，使它们作为区块出现在 NVTX 行。应该用 NVTX range 与 `--nvtx-capture` 过滤掉 warmup，还可以分别圈出 forward、backward 和 self-attention 内的 score matmul、softmax、final matmul。可以通过给 `cs336_basics.model.scaled_dot_product_attention` 赋值，把带标注版本换进 benchmark。`torch.compile` 会让源码归因更困难，可能需要对不同部分分别包裹或移除 compile/NVTX 才能正确归因。
+
+`nsys_profile` 题选择两个模型尺寸，以及三个大于 128 的 2 的幂上下文长度；最大长度应是显存能容纳的最长长度。对每个 profile：比较 Nsight forward 总时间与 Python 计时；找 forward 累计 GPU 时间最长的 kernel、单次 forward 调用次数，以及 forward+backward 时是否仍相同；列出 matmul 之外占用不可忽视的 kernels；profile 一次包含自写 AdamW 的完整 step，比较 inference 与 training 中 matmul 和其他 kernels 的时间占比；比较 attention 内 softmax 与 matmul runtime，并和 FLOPs 差距对照。
+
+##### 2.1.5 Mixed precision
+
+此前参数和 activations 都是 FP32。现代 NVIDIA GPU 有专门加速低精度矩阵乘法的 Tensor Cores。题面举例：B200 规格中的 FP32 峰值为 80 TFLOPS，而 FP16/BF16 峰值可达 2500 TFLOPS，所以较低精度应能加速训练和推理。
+
+但直接把整个模型转成低精度会降低数值准确度。许多 gradient 很小，FP16 无法表示，可能直接变成零；常用 loss scaling 把 loss 乘一个系数，使 gradient 变大，避免 flush to zero。FP16 动态范围也小，overflow 会表现为 NaN loss。完整 BF16 训练通常更稳定，因为 BF16 与 FP32 动态范围相同，但最终模型质量仍可能和 FP32 不同。
+
+PyTorch 用 `torch.autocast` 实现 mixed precision：matmul 等算子使用低精度，需要 FP32 动态范围的 accumulation/reduction 保持高精度。题面示例在 autocast context 中调用模型。即使被累加的 tensor 已降精度，accumulator 仍应更高精度。
+
+`mixed_precision_accumulation` 题要求运行四段把 `0.01` 加 1000 次的代码并评论精度。`benchmarking_mixed_precision` 题先分析含两个 Linear、一个 LayerNorm 和 ReLU 的 ToyModel：在 CUDA FP16 autocast 下分别写出参数、`fc1` 输出、LayerNorm 输出、logits、loss、gradients 的 dtype；解释 LayerNorm 哪些步骤对低精度敏感，以及换 BF16 后为什么仍值得谨慎；最后给 benchmark 增加可选 BF16 autocast，对所有模型比较 full precision 与 mixed precision 的 forward/backward 时间，并说明规模变化趋势。`nullcontext` 可用来统一开启/关闭 autocast 的代码路径。
+
+##### 2.1.6 Memory profiling
+
+除计算外，显存是训练与推理的另一项主要资源。PyTorch memory profiler 可以记录整个生命周期中的 allocation。warmup 后调用 `_record_memory_history`，执行被测区间，再 `_dump_snapshot("memory_snapshot.pickle")`，最后关闭记录。把 pickle 拖到 `pytorch.org/memory_viz`，可查看总体 memory timeline、每次 allocation 的大小以及对应 stack trace。
+
+`memory_profiling` 题要求用 xl 模型、context 128 和 2048 profile forward 与完整 step。提交 forward-only 与 forward+backward+optimizer 的 Active Memory Timeline 图片并解释峰值属于哪个阶段；给两种 context 的 forward/full-step peak memory 表；用 mixed precision 重测并说明是否显著；推导 xl residual-stream activation 的 FP32 MiB；调低 Memory Visualizer 的 Detail，找最大 allocations 及其 stack trace 来源；最后用 Nsight memory flags 和 PyTorch NVTX labels 计算单个 TransformerBlock 为 backward 保存多少 residual，列出最大的五个 operation 和占比，再根据 forward allocation 与逐 block backward 内存变化估算一个 block 的 gradient tensors 大小，检查是否符合预期。
+
+### 3. 单 GPU 显存（原文第 10–15 页）
+
+后文会跨 GPU 分片 tensor，但单 GPU 也能通过 gradient checkpointing（又称 activation checkpointing）降低峰值。
+
+#### 3.1 Autograd residuals
+
+backward 需要 forward activations。PyTorch 为 backward 保存的 tensor 称为 residuals 或 saved tensors。题面给 RMSNorm 加 `saved_tensors_hooks`：`pack_hook` 在保存时打印 shape/dtype/grad_fn，`unpack_hook` 在读取时打印。输出显示看似简单的 RMSNorm 也写出多个 tensor，其中多个与完整 activation 同尺寸。
+
+#### 3.1.1 Operator fusion
+
+这些基础 operations 的粒度过细；理想情况是一个 RMSNorm op 接收 weight 与 activation，产生 output，并在 backward 中作为一个整体。kernel fusion 的动机之一正是减少这些中间 residual。把 RMSNorm 包进 `torch.compile` 后，只需保存一个全尺寸输入、weight 和一个每 token 标量统计量。读取顺序不再只是保存顺序的严格逆序，residual 也没有各自的 `grad_fn` 依赖，因为 PyTorch 把整个 RMSNorm 看作一个 function。
+
+#### 3.2 Activation checkpointing
+
+fusion 仍有上限。题面把 xl 尺寸的单个 TransformerBlock 以 `fullgraph=True` compile，并用 hook 累计非 Parameter saved tensors；结果为 3651.31 MiB。每层 3.6 GiB，32 层就会保存约 114 GiB activation。attention residual 有一部分浪费会在第 4 节修复，但即使修复，内存仍随 batch、sequence、embedding 线性增长。
+
+checkpoint 不保留生成的每个 tensor，而是只保存周期性边界，并在 backward 重算中间值。`torch.utils.checkpoint.checkpoint(function, *args)` 在 forward 保存函数输入并抑制内部 tensor 保存；backward 到达该函数时，先用保存输入重跑 forward、生成当前所需 saved tensors，再执行正常 backward 并释放。
+
+四个普通 block 的 saved tensors 约为四倍，即 14605.25 MiB。把两个 block 封成函数、连续调用两个 checkpoint 后，题面示例只长期保存两个 `[4,2048,2560]` 输入和空 bookkeeping tensor，总计 160 MiB。这并没有彻底消除内存，而是把它分成长期 checkpoint boundary 与重算期间的短期 residual。checkpoint 越多，单个重算块越小，但边界越多；峰值需要在两者间平衡。示例中重算 residual 仍占主导，因此可缩小 checkpoint block scope。改变非嵌套 block 大小不改变总重算量；若愿意继续用计算换显存，可以把 checkpoint 嵌在 checkpoint 中递归重算。
+
+`gradient_checkpointing` 题给出 $N$ 个顺序相同 Transformer blocks。第一问要求在忽略 compute cost 时设计嵌套策略，说明 checkpoint 排列、peak activation memory 和 compute 的渐进复杂度并给 code sketch。第二问固定 xl、batch 4、sequence 2048，并限制只能进行一轮重算、不得嵌套；要求找最佳 block size，以 profiler 验证，并测相邻更小/更大的 size。
+
+### 4. GPU kernels（原文第 15–29 页）
+
+#### 4.1 用 FlashAttention-2 优化 attention
+
+profile 应显示 attention 在计算和显存方面都有优化空间。attention 是 score matmul、softmax、output matmul。朴素实现为每个 batch/head 保存 `[seq_len, seq_len]` scores，长序列会产生 OOM。FlashAttention-2 按 tile 计算，从不显式物化完整 score matrix，因此可扩展到更长上下文。
+
+`pytorch_attention` 题固定 batch 8、移除 multihead 维，扫描 head dimension `[16,32,64,128]` 与 sequence `[256,1024,4096,8192,16384]` 的笛卡尔积；生成随机 Q/K/V；对 100 次 forward 计时；在 backward 前测显存并对 100 次 backward 计时；必须 warmup 且每次后 synchronize。部分配置按 GPU 情况会 OOM。报告 timing/OOM 表，指出从何尺寸开始 OOM，对一个最小 OOM 配置做 attention memory accounting，说明 saved-for-backward 如何随 sequence 变化，以及怎样消除该成本。
+
+#### 4.2 `torch.compile`
+
+PyTorch 2.0 起提供 JIT compiler，会分析 computation graph 并尝试融合、生成 Triton kernel。接口只需 `compiled_layer=torch.compile(layer)`，也可 compile 整模型或普通 Python function。`torch_compile` 题先把 attention benchmark 加入 compiled 版本，与同配置 uncompiled 版本比较 forward/backward；再 compile 整个 Transformer，在端到端脚本比较 forward、forward+backward 与 optimizer step。
+
+即使 compile，普通 attention 在长序列仍有很差的 memory access pattern。因此下一步手写 Triton FlashAttention-2，直接控制何时访问哪块内存。
+
+#### 4.2.1 Triton weighted-sum 示例
+
+示例操作对任意 `x:[...,D]` 逐元素乘一维 `weight:[D]`，再沿最后一维求和，即矩阵向量乘。每个 Triton program instance 处理 x 的一个 row tile；program 是一组运行同一代码的 threads，不同 blocks 可并行。kernel 接收指向首元素的 pointers 与每轴 strides，而不是 PyTorch tensor object。
+
+`tl.make_block_ptr` 需要首指针、全 tensor shape、strides、当前 offsets、每次 block shape 与 memory order。`tl.program_id(0)` 选择 row tile；若 tile 不整除总 shape，`tl.load/tl.store` 要加 `boundary_check` 与 zero padding。沿 D 循环时，用 `.advance((0,D_TILE_SIZE))` 推进 x pointer、用 `.advance((D_TILE_SIZE,))` 推进 weight pointer。FP32 output buffer 累加每个 tile 的 row sum，最后写回一个 row 对应的 scalar。
+
+PyTorch wrapper 继承 `torch.autograd.Function`。forward 保存 x/weight，先把 x reshape 成二维并检查 shape、CUDA、contiguous；选择 tile size；分配未初始化 output；用一维 launch grid `ceil(n_rows/ROWS_TILE_SIZE)` 调 kernel；最后恢复输出 shape。launch grid 的 tuple 决定可通过哪个 `tl.program_id(axis)` 访问 block index。
+
+自定义 kernel 还需自己写 backward。设 $f(x,w)_i=\sum_jx_{ij}w_j$，给定 output gradient：$d x_{ij}=w_jd f_i$，$d w_j=\sum_i x_{ij}d f_i$。前者是 `grad_output` 与 weight 的 outer product。后者跨 row tiles reduction：每个 program 先把局部结果写入 `[n_row_tiles,D]` 的 partial buffer，kernel 外再用 `torch.sum(axis=0)` 得到最终 weight gradient；也可以另写 reduction kernel。`WeightedSumFunc.backward` 分配 `partial_grad_weight` 和 `grad_x`，启动 kernel，然后返回 `grad_x, grad_weight`。`WeightedSumFunc.apply` 因而像 `torch.nn.functional` 中的函数一样参与 autograd，输出上会有自定义 grad_fn。
+
+#### 4.2.2 FlashAttention-2 forward
+
+在动手前，原文强烈建议先读原始 FlashAttention 论文理解 tiled online softmax，并读 online normalizer 工作和 GPU 执行直觉文章。
+
+普通 attention 的 backward 依赖巨大 forward activations。$dV=P^TdO$ 和 softmax backward 都需要 `[batch,heads,seq,seq]` 的 $P$；标准实现会在 HBM 与片上 SRAM 之间多次搬运 $P$。FlashAttention 的目标是避免把 attention matrix 写入或读出 HBM，以降低 IO 和 peak memory，依靠三项技术：tiling、recomputation、operator fusion。
+
+tiling 把输入切块、多次读取 input tiles，增量完成 softmax reduction；recomputation 不保存平方大小的 attention matrix，只保存少量 activation checkpoints，并保存每行 $L_i=\log\sum_j\exp S_{ij}$，backward 时重算其余值；operator fusion 把 attention 所有步骤放入一个 kernel，让中间值留在片上。
+
+backward 前先在 global memory 计算 $D=\operatorname{rowsum}(O\circ dO)$。它等于 $\operatorname{rowsum}(P\circ dP)$。有 L 和 D 后，可以用 $S=QK^T/\sqrt d$、$P_{ij}=\exp(S_{ij}-L_i)$ 重建概率，不再执行 softmax；然后按公式 15–19 得到 dV、dP、dS、dQ、dK。
+
+forward 的 query tile 大小为 $B_q$、key tile 为 $B_k$。对每个 query tile，载入 Q；初始化 output accumulator、running denominator $l=0$、running max $m=-\infty$；循环 K/V tiles，计算 scores，更新 row max，计算未归一概率，按最大值变化重缩放旧 denominator/output，再加入新 tile；循环结束除以最终 denominator，保存 $L=m+\log l$，写 output 和 L 到 global memory。
+
+Triton 调试提示包括：用 `tl.device_print`，或尝试 `TRITON_INTERPRET=1`（原文指出解释器可能有 bug）；核对 block pointer offsets 是否乘 tile size；launch grid 用 `kernel[(d1,d2,...)]`；matmul 用 `tl.dot`；推进 pointer 必须把返回值重新赋给变量。
+
+`flash_forward` (a) 要求纯 PyTorch `autograd.Function` 实现 tiled forward，接收 Q/K/V 与可选 `is_causal=False`，暂时可忽略 causal；输出 O、保存 L/Q/K/V/O，backward 可先抛 `NotImplementedError`。tile 至少 16×16，测试 shape 都是至少 16 的 2 的幂。连接 `get_flashattention_autograd_function_pytorch`，运行 `pytest -k test_flash_forward_pass_pytorch`。
+
+(b) 把同一算法写成 Triton fused kernel，另建 `autograd.Function` 调它。launch grid 为 `(Tq,batch_size)`，每个 instance 只访问一个 batch 和一个 query tile，kernel 只有一个循环，遍历 key tiles，循环末推进 pointers。scale 为 $1/\sqrt d$。片上 O/l/m 用 FP32；若用 `tl.dot(...,acc=acc)` 累加，概率先转 V dtype；写回时 output 转目标 dtype。连接 `get_flashattention_autograd_function_triton` 并运行对应测试。
+
+(c) 加 causal flag，并把 Triton 参数标为 `is_causal: tl.constexpr`。用全局 query/key index 构造 $B_q\times B_k$ mask，被遮位置加 `-1e6`；用 `ctx.is_causal` 供 backward 使用。flag 必须可选且默认 False，以保持旧测试通过。
+
+`flash_backward` 题允许用普通 PyTorch 和 `torch.compile`，输入 Q/K/V/O/dO/L，计算 D 并按公式 13–19 返回 dQ/dK/dV，运行 `pytest -k test_flash_backward`。
+
+`flash_benchmarking` 题用 `triton.testing.do_bench` 比较部分 Triton FlashAttention-2 与普通 PyTorch attention 的 forward、backward 和端到端 latency。在单张 B200、batch 1、causal 下，扫描 sequence 的 2 的幂 128 到 65536、d 的 2 的幂 16 到 128、BF16 与 FP32；必要时按 input 调 tile size，提交完整表。
+
+可选 Triton backward 采用两个方向的 tiled pass。第一个 key-major：每个 K/V tile 循环所有 Q tiles，重算 P，累积 dV 和 dK；第二个 query-major：每个 Q tile 循环所有 K/V tiles，累积 dQ。重复计算 P 可以避免 thread blocks 间同步，从而避免慢 atomics。算法先算 D，再分别按公式写回 dK/dV 与 dQ。
+
+### 5. Distributed Data Parallel（原文第 29–36 页）
+
+接下来使用多 GPU，重点研究 data parallelism。先介绍 PyTorch distributed communication，再实现朴素 DDP，最后实现和 benchmark 多种通信优化。
+
+#### 5.1 单节点 distributed communication
+
+题面示例启动四个 worker processes，每个生成一个随机整数 tensor，再用 all-reduce 求和。`mp.spawn(fn,args,nprocs)` 启动 `nprocs` 个进程，并以 `fn(rank,*args)` 调用；rank 是 0 到 `nprocs-1` 的 worker index，world size 是总 worker 数。
+
+每个 worker 属于通过 `dist.init_process_group` 创建的 process group。group 中的 workers 通过共享 master 协调，master 的 IP/port 由环境变量给出，rank 0 是 master process。all-reduce 等 collectives 在整个 group 上操作。示例使用 Gloo，因此 CPU-only 机器也能运行；CUDA tensors 应使用基于 NVIDIA NCCL 的后端，它通常更快。多 GPU 时不同 rank 必须选择不同 GPU，可在 setup 调 `torch.cuda.set_device(rank)`，也可显式使用 `device=f"cuda:{rank}"`。
+
+示例输出中每个 rank 的原数据不同，all-reduce 后都变成逐元素总和。多次运行时 print 顺序不确定，因为分布式进程调度没有固定顺序；保证的是 collective 完成后各 rank 结果 bitwise identical。
+
+原文术语定义如下：node 是网络中的一台机器；worker 是参加分布式训练的程序实例，本作业一个 worker 只有一个 process，实践中 worker 也可能用额外进程加载数据；world size 是 process group 的 worker 总数；global rank 是 `[0,world_size-1]` 的全局唯一 ID；local world size 是一台 node 上的 workers 数；local rank 是 `[0,local_world_size-1]` 的本机 ID。单节点时 local/global world size 相同，local/global rank 也相同。原图 3 展示两台 node、world size 8，每台四个 local ranks 的布局。
+
+distributed benchmark 的最佳实践：尽量在同一机器做受控比较；NCCL 也要至少约 5 次 warmup；GPU 计时要 `torch.cuda.synchronize()`，即使 communication 传了 `async_op=False`，因为它只保证 operation 已排到 GPU；不同 rank 时间可能不同，应用 `dist.all_gather_object` 汇总；CPU/Gloo 用于本地调试，GPU/NCCL 用于最终 benchmark，切换主要是 backend 与 device cast。
+
+`distributed_communication_single_node` 题写脚本测单节点多进程 all-reduce。float32 tensor 从 1 MB、10 MB、100 MB 到 1 GB，GPU/process 数为 2、4、6；最多使用 6 GPU，每次 run 应少于 5 分钟。提交图或表，并用 2–3 句评论 data size、GPU 数与 runtime 的关系。
+
+#### 5.2 朴素 DDP
+
+data parallel 把 batch 分到多个 devices，使全局 batch 可以超过单卡容量。例如四张卡各放 32 个样本，全局 effective batch 为 128。最小 DDP 步骤：每张卡先随机建模型，再由 rank 0 broadcast 参数，使各卡参数相同；每卡保留完整 optimizer state；把 $n$ 个样本均匀分为 $d$ 份，$d$ 应整除 $n$ 以避免慢 rank 拖住整个 step；每卡对本地 $n/d$ 样本 forward/backward；all-reduce 并平均 gradients，使每卡得到全局 $n$ 样本的平均梯度；每卡执行同一个 optimizer step。因为每卡以相同参数、optimizer state 和平均 gradient 更新，后续参数/状态保持同步。
+
+`naive_ddp` 题实现 backward 完成后逐 parameter all-reduce 的版本，连接 `get_ddp` 与可选 `ddp_on_after_backward`，运行 `tests/test_ddp.py`。`naive_ddp_benchmarking` 用单节点两 GPU、xl 模型测每 training step 总时长，以及 gradient communication 所占时间，并描述设置。
+
+#### 5.3 改进 DDP
+
+朴素实现有两个问题：每个 parameter 都单独 all-reduce，每次 call 都有 overhead；并且等整个 backward 完成后才通信，错过了 gradient 逐层产生时与 compute 重叠的机会。
+
+第一种改进把所有 gradients 拼成一个 tensor，只发一次 all-reduce，再恢复原 shape；可使用 `torch._utils._flatten_dense_tensors` 与 `_unflatten_dense_tensors`。`minimal_ddp_flat_benchmarking` 在同样 1 node × 2 GPU、xl 设置下对比逐参数与单 batched call，报告 step 和 communication 时间。
+
+第二种改进在 parameter gradient ready 时立即异步 all-reduce。`register_post_accumulate_grad_hook` 会在 gradient 累积后调用函数。collective 的 `async_op=False` 会阻塞到 operation 排进 GPU，但 CUDA 本身仍异步；`async_op=True` 更早返回 `Work` handle，连排队完成都不保证。稍后调用 `handle.wait()`，保证 collective 已排队且其 output 可供后续依赖使用。多 CUDA streams 的高级场景还可能需要 stream 间显式同步。
+
+`ddp_overlap_individual_parameters` 题要求 wrapper 构造时 broadcast weights，forward 代理 module，gradient ready 时异步平均，并提供 `finish_gradient_synchronization()`。训练循环必须在 backward 后调用 finish，再 optimizer step。连接 adapters，反复运行测试约 5 次以发现 race condition。
+
+对应 benchmark 仍是 1 node、2 GPU、xl，和逐参数同步、flatten 一次通信比较。还要给两种实现加 Nsight instrumentation，各提交一张 timeline，视觉上证明一个没有 overlap、另一个把 communication 与 backward compute 重叠。
+
+### 6. Optimizer state sharding（原文第 36–38 页）
+
+DDP 简单有效，但每个 rank 保存完整参数与 optimizer state，产生重复内存。AdamW 每个 parameter 维护两个 float state，因此 optimizer state 约是 model weight 的两倍。ZeRO 论文描述了依次分片 optimizer state、gradients、parameters 的方法。
+
+本节实现简化的 optimizer-state sharding：每个 rank 的 optimizer 只处理约 `1/world_size` 参数。step 时每 rank 只更新自己的 shard，然后 broadcast 新参数，使所有 rank 再次同步。
+
+`optimizer_state_sharding` 题要求 wrapper 继承 `torch.optim.Optimizer`。`__init__(params,optimizer_cls,**kwargs)` 接受普通参数 iterable 或带不同超参数的 parameter groups，调用 Optimizer 父构造，并把 kwargs 传给本地 optimizer。`step(closure,**kwargs)` 调本地 optimizer 后同步更新。`add_param_group` 既会在父构造期间被调用，也可能在训练中因逐步解冻新增 group，因此必须在任何时刻分配 owner。连接 `get_sharded_optimizer`，反复运行 `tests/test_sharded_optimizer.py`。
+
+accounting 题在 1 node、2 GPU、xl 设置下分别 profile 普通与 state-sharded optimizer：报告模型初始化后、optimizer step 前、step 后的 peak memory，并分解 parameters、gradients、optimizer states；测每 iteration runtime；最后说明本实现与 ZeRO stage 1（论文称 ZeRO-DP $P_{os}$）在 memory 与 communication volume 上的差别。
+
+### 7. Fully-Sharded Data Parallel（原文第 38–39 页）
+
+optimizer sharding + data parallel 已分片 optimizer state 与 activations，但每张 GPU 仍保存完整 weights。FSDP 让每张卡只常驻每个 weight tensor 的一个 slice；forward/backward 前用 all-gather 临时组成完整 weight。
+
+为防 GPU compute 等 communication，多数 FSDP 实现会提前调度下一层 all-gather，使权重在使用前准备好。只要通信追得上计算且提前安排，它就可离开关键路径。很小的 layer 其 transfer latency 可能不值得分片；本架构主要不分 norms，而分 embedding 与所有 linear。需要反复累加更新的 master weights 必须 FP32，但实际计算可低精度，因此 mixed precision 可以在通信前转换，节省带宽。
+
+`fsdp` 题要求 wrapper 包住任意 module，并 hook 或 wrap 其中 Linear/Embedding。构造时安排 forward weight all-gather；为限制显存，最多在目标层前两层完成后才开始 gather。backward 也要 gather 权重，gradient ready 后 reduce-scatter，并及时释放 full weights。若提供 `compute_dtype`，通信/计算用它，master weights 与 optimizer update 仍 FP32。wrapper 代理 forward，并有 finish 方法等待异步 communication。每个 shard 必须兼容 A1 标准 AdamW。连接 `get_fsdp`，反复跑测试捕获 race。
+
+`fsdp_accounting` 先依据第 6 节估算 peak 能再省多少（可忽略预分配 all-gather buffers），再 profile 两 GPU xl 权重 all-gather 是否能及时完成，提交 timings 与 Nsight 截图。
+
+### 8. 并行策略分析（原文第 39–46 页）
+
+常见并行轴包括：DP 把 batch 分到设备并平均 gradient；FSDP 进一步分 optimizer state、gradient、weight，并在前后向 gather weight shards；TP 沿 weight input/output dimension 分片，随后 reduce/gather activations；PP 按 layer 把模型分为 pipeline stages；EP 把 Mixture-of-Experts 中的 experts 分到设备。本节重点计算 DP、FSDP、TP 及组合的 communication cost，与 compute cost 比较，找出 communication 成为瓶颈前能扩到多少设备。题面推荐 TPU Scaling Book 与 Ultra-Scale Playbook 的 pipeline appendix。
+
+#### 8.1 Communication primitives
+
+简化设定有 $N$ 个全互联 devices，每个 device egress bandwidth 为 $W$ bytes/s。ring all-gather 中，每卡初始有总大小 $S$ 的一个 $S/N$ shard；设备排成环，每轮把当前 chunk 发给右侧、从左侧接收新 chunk，经过 $N-1$ 轮得到完整 tensor。每轮每卡同时传 $S/N$，所以时间为 $\frac{N-1}{N}\frac SW$。
+
+ring reduce-scatter 中，每卡初始有完整 $S$ tensor，先切 $N$ chunks。每轮沿环传一个 partial-sum chunk，接收后加上本地贡献；$N-1$ 轮后 device i 只保留完整 reduction 的第 i 个 chunk。它传输同样的 chunk 数与大小，所以时间也为 $\frac{N-1}{N}\frac SW$。ring all-reduce 由 reduce-scatter 加 all-gather 组成，时间为 $2\frac{N-1}{N}\frac SW$。
+
+`alternate_ring_all_reduce` 让每卡在 $N-1$ 轮中转发另一个设备的完整 $S$ tensor，并把它加进本地 sum。题目要求给出时间和一句理由；答案是 $(N-1)S/W$，因为每轮都发送完整 tensor，而不是 $S/N$ chunk。
+
+#### 8.2 Data parallel
+
+单个 SwiGLU FFN 的 forward 为 $x_1=xW_1$、$x_2=xW_2$、$z=f(x_1)*x_2$、$y=zW_3$。x 为 `[B,D]`，W1/W2 为 `[D,DFF]`，W3 为 `[DFF,D]`。backward 依次为 $dz=dyW_3^T$、$dx_2=dz*f(x_1)$、$dx_1=dz*f'(x_1)*x_2$、$dx=dx_1W_1^T+dx_2W_2^T$、$dW_3=z^Tdy$、$dW_2=x^Tdx_2$、$dW_1=x^Tdx_1$。
+
+DP 用 $N_{DP}$ 设备把 x 切成 `[B/NDP,D]`。forward 不需要 collective。每卡 backward 得到只对本地 outer products 求和的 partial dW，随后 all-reduce 得全局 dW。
+
+`data_parallel_calcs` 设设备算力 C FLOP/s、egress W bytes/s，weights/activations 均 FP16。求每设备 backward matmul FLOPs；求 backward communication time；令 communication 不超过可重叠的 compute，解出 $N_{DP}$ 上限，并为每个式子给一句依据。
+
+#### 8.3 FSDP
+
+FSDP 同样分 batch，并把 optimizer state、gradient、weight 分片，每个 weight shard 大小约 $DD_{FF}/N_{FSDP}$。forward 先分别 all-gather W1/W2/W3，再执行 batch-sharded forward，使用后丢弃 full weight。backward 前再次 all-gather，执行 data-parallel backward，但每卡只需要自己的 gradient shard，所以对 dW 使用 reduce-scatter 而非 all-reduce。
+
+`fsdp_calcs` 在相同设定下分别求 forward/backward FLOPs、communication time，以及两阶段分别在多少设备后 communication-bound。
+
+#### 8.4 Tensor parallel
+
+TP 可沿 weight input 或 output dimension 分片。output-dimension sharding 常称 column parallel：每卡 W shard 为 `[D,DFF/NTP]`，局部 `xW_i` 后 all-gather output。input-dimension sharding常称 row parallel：每卡 W shard 为 `[D/NTP,DFF]`，也切 x，对局部 products 做 all-reduce。
+
+本节把 W1/W2 设为 column parallel，W3 设为 row parallel。W1/W2 输出恰好就是 W3 所需 input shard，因此中间不做 all-gather；每卡算局部 x1/x2/z/y，最后对 y all-reduce。
+
+`tp_calcs` 先从完整 backward 修改出 sharded equations，产生每卡 dW1/dW2/dW3 和最终 dx；然后求 forward/backward FLOPs、communication time，并解出两个阶段各自的设备上限。
+
+#### 8.5 二维 FSDP + TP
+
+batch 超过 critical batch size 后，gradient noise 过小会失去 SGD 隐式 regularization；模型大小又常由 scaling laws 决定。因此目标不是无限放大 batch/model，而是在给定 batch、model、bandwidth、accelerator speed 下选择 FSDP 与 TP，尽量扩设备且保持 compute-bound。
+
+每个设备有 TP rank $i$ 与 FSDP rank $j$，总数 $N=N_{TP}N_{FSDP}$。先按 TP：W1/W2 切 output，W3 切 input；再按 FSDP 沿另一 weight 维继续切，并把 batch 切到 FSDP ranks。于是 W1/W2 shard shape 为 `[D/NFSDP,DFF/NTP]`，W3 为 `[DFF/NTP,D/NFSDP]`。forward 先在 FSDP 轴 all-gather 出当前 TP weight shard，做本地 matmul，再在 TP 轴 all-reduce activation，最终输出仍按 batch 分片。
+
+`fsdp_tp_calcs` 求二维 forward FLOPs；在两轴 collectives 可重叠时，communication time 应写成 FSDP cost 与 TP cost 的 max；求最优 $N_{TP},N_{FSDP}$ 下总设备上限；最后假设两轴共享网络、不能重叠，把 max 改为 sum，再连续优化两轴尺寸，不必把结果截成整数。
+
+### 9. Leaderboard（原文第 46–48 页）
+
+leaderboard 测 8B 模型完整 training step。不能改变模型 input/output 行为；实现会和 `cs336_basics` 模型比较。输入为 BF16、causal，普通测试也必须通过；必须是自己的实现，不能复制现成实现。运行在两张 B200，batch 2、sequence 32768，故意很难放入显存。
+
+配置为：context 32768、vocab 151936、d_model 4096、d_ff 11008、34 层、32 heads、BF16、causal、batch 2。测试创建 labels/targets、模型与 AdamW；每次清 gradient、forward、cross entropy sum、backward、optimizer step；`triton.testing.do_bench` 正式设置为 30,000 ms repetitions 与 10,000 ms warmup，调试时可缩短。
+
+建议优化包括：用 Triton autotune 调 tile；调 `torch.compile`/Triton 配置；fused AdamW；融合 LM head 与 cross entropy，避免物化 `[batch,seq,vocab]` 完整 logits，并可立即融合 backward；把 FlashAttention backward 写成 Triton 两 pass；causal 时跳过全零 tiles；把非 mask tiles 与 diagonal tiles 分开，前者免 index compare；Hopper 后硬件尝试 TMA；只有确实需要显存时才用 activation checkpointing 交换速度。
+
+`leaderboard` 题提交两 B200 上完整 forward+loss+backward+AdamW 的最佳 wall-clock time。从空 PyTorch/Triton cache 开始必须在 10 分钟内完成，因此不能无限 autotune/compile。课程预期超过朴素 10 秒 baseline，并把结果提交到官方 leaderboard 仓库。
+
+### 参考文献（原文 Bibliography）
+
+1. Tri Dao，[FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691)。
+2. Tri Dao、Daniel Y. Fu、Stefano Ermon、Atri Rudra、Christopher Ré，[FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness](https://openreview.net/forum?id=H4DqfPSibmx)，NeurIPS 2022。
+3. Maxim Milakov、Natalia Gimelshein，[Online normalizer calculation for softmax](https://arxiv.org/abs/1805.02867)。
+4. Horace He，[Making Deep Learning Go Brrrr From First Principles](https://horace.io/brrr_intro.html)，2022。
+5. Samyam Rajbhandari、Jeff Rasley、Olatunji Ruwase、Yuxiong He，[ZeRO: Memory Optimizations Toward Training Trillion Parameter Models](https://arxiv.org/abs/1910.02054)，2020。
+6. James Austin 等，[How to Scale Your Model / TPU Scaling Book](https://jax-ml.github.io/scaling-book/)，2025。
+7. Hugging Face 团队，[The Ultra-Scale Playbook: Training LLMs on GPU Clusters](https://huggingface.co/spaces/nanotron/ultrascale-playbook)，2025。
 
 <Accordions>
-  <Accordion title="FlashAttention 出现 NaN">检查全 mask 行、最大值初始化、旧累积量重缩放、FP32 accumulator，以及写回前是否除以最终 l。</Accordion>
-  <Accordion title="DDP 与单进程差一个 world_size">通常是 all-reduce 后没有取平均，或 baseline loss reduction 与每 rank reduction 不一致。</Accordion>
-  <Accordion title="FSDP 第二步才坏">优先检查 optimizer 是否一直引用同一个 shard Parameter、full weight 是否正确释放、step 后 gather 的是否为新 shard。</Accordion>
+  <Accordion title="FlashAttention output 对，LSE 错">检查最终保存的是 `m + log(l)`，不是 `log(l)`；检查每次最大值变化时旧 denominator 与 output 是否同时乘了 `exp(m_old-m_new)`。</Accordion>
+  <Accordion title="DDP 与单进程总差一个 world_size">确认每 rank 的 loss reduction 与 global baseline 一致，并且 all-reduce 后取平均。若 local loss 已经是 sum，缩放规则需要相应改变。</Accordion>
+  <Accordion title="异步 DDP 偶发失败">通常是 `optimizer.step()` 越过了 Work handles，或上一轮 pending list 没清空。测试连续多跑几次能更容易暴露 race。</Accordion>
+  <Accordion title="FSDP 第一轮正确、第二轮参数错">确认 optimizer 始终引用 master shard Parameter，而不是临时 full tensor；step 后下一次 gather 必须读取更新后的 shards；full-param 导出不能修改训练中的 parameter data。</Accordion>
+  <Accordion title="mixed-precision FSDP shape/dtype 报错">通信前转换的是临时 shard copy，FP32 master shard 不能被替换；gradient collective 后要转回 master dtype，且 `param.grad.shape == param.data.shape`。</Accordion>
 </Accordions>
