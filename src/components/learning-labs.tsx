@@ -1,7 +1,7 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { ArrowRight, Check, Circle, Info, RotateCcw, X } from 'lucide-react';
+import { ArrowRight, Check, Circle, Info, RotateCcw, Sparkles, X } from 'lucide-react';
 import type { ReactNode } from 'react';
 
 /* ──  TensorShapeLab  ── */
@@ -345,6 +345,20 @@ export function ConceptBridge({ title, label = '理解桥', children }: { title:
     <aside className="concept-bridge">
       <div className="concept-bridge-heading"><span>{label}</span><strong>{title}</strong></div>
       <div className="concept-bridge-body prose">{children}</div>
+    </aside>
+  );
+}
+
+/* ──  KnowledgeBridge · 破解知识诅咒  ── */
+export function KnowledgeBridge({ insight, children }: { insight: string; children: ReactNode }) {
+  return (
+    <aside className="knowledge-bridge">
+      <div className="knowledge-bridge-head">
+        <Sparkles size={17} />
+        <span>先建立直觉 · 再进入细节</span>
+      </div>
+      <p className="knowledge-bridge-insight">{insight}</p>
+      <div className="knowledge-bridge-body prose">{children}</div>
     </aside>
   );
 }

@@ -1336,6 +1336,50 @@ body {
   margin-bottom: 0;
 }
 
+/* ──  KnowledgeBridge · 破解知识诅咒  ── */
+.knowledge-bridge {
+  margin: 2rem 0 2.4rem;
+  overflow: hidden;
+  border: 1px solid var(--lab-amber);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--lab-amber) 5%, var(--lab-card) 95%);
+  box-shadow: 7px 7px 0 color-mix(in srgb, var(--lab-amber) 15%, transparent);
+  color: var(--lab-ink);
+  font-family: var(--lab-sans);
+}
+
+.knowledge-bridge-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 20px 0;
+  color: #b0880c;
+  font-family: var(--lab-mono);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.knowledge-bridge-insight {
+  margin: 0;
+  padding: 10px 20px 0;
+  font-family: var(--lab-serif);
+  font-size: 1.22rem;
+  line-height: 1.55;
+  color: var(--lab-ink);
+}
+
+.knowledge-bridge-body {
+  padding: 8px 20px 20px;
+  color: var(--lab-muted);
+  font-size: 0.88rem;
+  line-height: 1.7;
+}
+
+.knowledge-bridge-body > :first-child { margin-top: 0; }
+.knowledge-bridge-body > :last-child  { margin-bottom: 0; }
+
 /* ──  CodeWalkthrough  ── */
 .code-walkthrough {
   margin: 2rem 0;
