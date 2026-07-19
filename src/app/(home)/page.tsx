@@ -155,15 +155,15 @@ export default function HomePage() {
           </p>
         </div>
         <div className="home-shell stage-flow">
-          {stages.map(({ glyph, title, text, bg, color }) => (
+          {stages.map(({ glyph, title, text, bg, color }, i) => [
             <article key={title}>
               <span>{glyph}</span>
               <div className="flow-symbol" style={{ background: bg, color: color ?? '#f0f0ff' }}>{glyph}</div>
               <h3>{title}</h3>
               <p>{text}</p>
-            </article>
-          ))}
-          <i aria-hidden="true"><ArrowRight /></i>
+            </article>,
+            i < stages.length - 1 && <i key={`arrow-${i}`} aria-hidden="true"><ArrowRight /></i>,
+          ])}
         </div>
       </section>
 
