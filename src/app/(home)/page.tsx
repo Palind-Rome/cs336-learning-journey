@@ -9,181 +9,250 @@ import {
   Database,
   FlaskConical,
   Gauge,
-  GitBranch,
-  Network,
   Sparkles,
 } from 'lucide-react';
-import { CodeProofStrip, LearningRouteSelector, TokenJourneyConsole } from '@/components/home-interactions';
+import { HeroConsole, PathSelector, ProofLedger } from '@/components/home-interactions';
 
-const stack = [
+const stages = [
   {
     number: '01',
-    title: '文本变成 token',
-    text: '从 Unicode 与 UTF-8 开始，训练 byte-level BPE，并亲手实现可流式编码的 tokenizer。',
-    icon: Braces,
-    href: '/docs/foundations/tokenization',
-    tone: 'lime',
+    glyph: 'B,T',
+    title: '从 bytes 到 logits',
+    text: 'Unicode 字符串经过 UTF-8、BPE、Embedding、Transformer，最终变成词表上的概率分布。闭合这条因果链，后续所有优化都有了一个可感知的基点。',
+    href: '/docs/foundations',
+    bg: 'var(--lab-indigo)',
   },
   {
     number: '02',
-    title: 'token 变成预测',
-    text: '逐层实现 RMSNorm、RoPE、attention 与 SwiGLU，追踪每个张量的形状和数值。',
-    icon: Network,
-    href: '/docs/foundations/transformer',
-    tone: 'violet',
+    glyph: '⇅',
+    title: '让 GPU 不再等待',
+    text: '把数学运算映射到 HBM、SRAM 与 Tensor Core；用 tiling、fusion 和 collectives 让同一模型跑出数倍吞吐。',
+    href: '/docs/systems',
+    bg: 'var(--lab-teal)',
+    color: '#11302b',
   },
   {
     number: '03',
-    title: '预测变成模型',
-    text: '把 loss、AdamW、学习率、数据批次与 checkpoint 接成一条可恢复的训练循环。',
+    glyph: 'ƒ',
+    title: '用小实验预测大训练',
+    text: '在受限预算下系统改变 N、D 与 recipe，测量 loss，再外推更大规模的最优配置。这不只是曲线拟合，而是一种决策思维。',
+    href: '/docs/scaling',
+    bg: 'var(--lab-coral)',
+    color: '#3d1b14',
+  },
+];
+
+const chapters = [
+  {
+    number: '01',
+    title: '基础与架构',
+    text: 'Tokenizer、Transformer、AdamW、训练循环——完成语言模型的最小闭环。',
+    icon: Braces,
+    href: '/docs/foundations',
+    tone: 'indigo',
+  },
+  {
+    number: '02',
+    title: '系统与效率',
+    text: 'FlashAttention、Triton kernel、DDP、FSDP——把数学结果高效映射到 GPU 集群。',
+    icon: Cpu,
+    href: '/docs/systems',
+    tone: 'teal',
+  },
+  {
+    number: '03',
+    title: '缩放与推理',
+    text: 'IsoFLOPs、Chinchilla、μP、量化与 speculative decoding——用科学方法做大规模决策。',
     icon: Gauge,
-    href: '/docs/foundations/training',
-    tone: 'orange',
+    href: '/docs/scaling',
+    tone: 'amber',
   },
   {
     number: '04',
-    title: '模型跑上集群',
-    text: '用 Triton、FlashAttention、DDP/FSDP 与推理系统把理论 FLOPs 变成真实吞吐。',
-    icon: Cpu,
-    href: '/docs/systems/gpu-kernels',
-    tone: 'blue',
+    title: '评测与数据',
+    text: '从 Common Crawl 到可训练语料：抽取、过滤、去重、混合与审计。',
+    icon: Database,
+    href: '/docs/data',
+    tone: 'coral',
   },
   {
     number: '05',
-    title: '能力来自全栈',
-    text: '用 scaling laws 决定预算，以数据工程塑造分布，再通过 SFT 与 RL 完成后训练。',
-    icon: Sparkles,
-    href: '/docs/alignment/post-training',
-    tone: 'pink',
+    title: '对齐与多模态',
+    text: 'SFT、DPO、GRPO、RLVR——把续写模型塑造成可控、可评测的助手。',
+    icon: FlaskConical,
+    href: '/docs/alignment',
+    tone: 'indigo',
   },
 ];
 
-const assignments = [
-  { id: 'A1', title: 'Basics', result: '一个从零训练的 Transformer LM', icon: Braces, href: '/docs/assignments/assignment-1' },
-  { id: 'A2', title: 'Systems', result: '更快的 kernel、attention 与分布式训练', icon: Cpu, href: '/docs/assignments/assignment-2' },
-  { id: 'A3', title: 'Scaling', result: '用小实验预测大模型最优配置', icon: GitBranch, href: '/docs/assignments/assignment-3' },
-  { id: 'A4', title: 'Data', result: '可审计的 Common Crawl 清洗管线', icon: Database, href: '/docs/assignments/assignment-4' },
-  { id: 'A5', title: 'Alignment', result: 'SFT、RFT 与 GRPO 推理训练闭环', icon: FlaskConical, href: '/docs/assignments/assignment-5' },
+const sources = [
+  'CS336 · Stanford 2026',
+  '17 Lectures',
+  '5 Assignments',
+  '9 Executable Notebooks',
+  'Triton · FSDP · GRPO',
+  'Source-First',
 ];
 
-const sources = ['17 LECTURES', 'A1 · BASICS', 'A2 · SYSTEMS', 'A3 · SCALING', 'A4 · DATA', 'A5 · ALIGNMENT'];
+const assignments = [
+  { id: 'A1', title: 'Basics', result: '从 bytes 训练 Transformer LM', tests: '46 tests passed', href: '/docs/assignments/assignment-1' },
+  { id: 'A2', title: 'Systems', result: '写快 attention，分到多 GPU', tests: '10 CPU tests passed', href: '/docs/assignments/assignment-2' },
+  { id: 'A3', title: 'Scaling', result: '从 IsoFLOPs 实验预测最优配置', tests: 'checks passed', href: '/docs/assignments/assignment-3' },
+  { id: 'A4', title: 'Data', result: '把 Common Crawl 变成训练数据', tests: '18 tests passed', href: '/docs/assignments/assignment-4' },
+  { id: 'A5', title: 'Alignment', result: 'GRPO、GSPO、SFT 与 DPO', tests: '26 tests passed', href: '/docs/assignments/assignment-5' },
+];
 
 export default function HomePage() {
   return (
-    <main className="journey-home">
-      <section className="journey-hero">
-        <div className="journey-glow journey-glow-one" />
-        <div className="journey-glow journey-glow-two" />
-        <div className="journey-shell journey-hero-grid">
-          <div className="journey-hero-copy">
-            <div className="journey-eyebrow"><Sparkles size={14} /> STANFORD CS336 · SPRING 2026 · INTERACTIVE EDITION</div>
+    <main className="lab-home">
+      {/* ── Hero ── */}
+      <section className="home-hero">
+        <div className="hero-glow hero-glow-one" />
+        <div className="hero-glow hero-glow-two" />
+        <div className="home-shell hero-grid">
+          <div className="hero-copy">
+            <div className="eyebrow">
+              <Sparkles size={14} /> LANGUAGE MODELING FROM SCRATCH · 2026
+            </div>
             <h1>
-              从一个字节开始，
-              <span>亲手训练语言模型。</span>
+              把语言模型拆开，
+              <span>再亲手装回去。</span>
             </h1>
-            <p className="journey-hero-lede">
-              不把 Transformer 当黑盒。沿着 tokenizer、架构、GPU 系统、缩放律、数据与对齐，读懂公式，也写出真正能通过测试、跑起实验的代码。
+            <p className="hero-lede">
+              从 UTF-8 的一个 byte 出发，沿着张量、GPU、集群、数据与奖励一路向前。
+              每个概念先建立直觉，再推公式、读源码、跑测试，最后变成一件真正能工作的系统。
             </p>
-            <div className="journey-hero-actions">
-              <Link className="journey-button journey-button-primary" href="/docs/roadmap">
+            <div className="hero-actions">
+              <Link className="button button-primary" href="/docs/roadmap">
                 开始学习 <ArrowRight size={17} />
               </Link>
-              <Link className="journey-button journey-button-ghost" href="/docs/assignments">
-                <BookOpen size={17} /> 打开作业工坊
+              <Link className="button button-ghost" href="/docs/assignments">
+                <BookOpen size={17} /> 进入作业工坊
               </Link>
             </div>
-            <CodeProofStrip />
+            <ProofLedger />
           </div>
-          <TokenJourneyConsole />
+          <HeroConsole />
         </div>
-        <div className="journey-source-ribbon" aria-label="课程材料覆盖">
-          <div className="journey-shell journey-ribbon-track">
-            <span className="journey-ribbon-label"><CircleDot size={14} /> COURSE MATERIALS</span>
+        <div className="source-ribbon" aria-label="课程概况">
+          <div className="home-shell ribbon-track">
+            <span className="ribbon-label"><CircleDot size={14} /> CS336 FULL STACK</span>
             {sources.map((source) => <span key={source}>{source}</span>)}
           </div>
         </div>
       </section>
 
-      <section className="journey-section journey-stack-section">
-        <div className="journey-shell journey-split-heading">
+      {/* ── Three stages flow ── */}
+      <section className="home-section">
+        <div className="home-shell split-heading">
           <div>
-            <p className="journey-section-kicker">ONE END-TO-END STORY</p>
-            <h2>不是五门散课，<br />而是一条训练链路。</h2>
+            <p className="section-kicker">THREE STAGES OF UNDERSTANDING</p>
+            <h2>不只是读懂，<br />是能复现和解释。</h2>
           </div>
           <p>
-            CS336 的每一部分都在回答同一个问题：怎样从原始网页得到一个会生成、能扩展、可对齐的语言模型。先把因果链连起来，再深入每个算法与实现。
+            每一站都先问「它在解决什么问题」，再用手算一次形状和梯度，最后用官方测试验证你的实现。
+            右边的三个步骤是整门课反复使用的认知循环。
           </p>
         </div>
-        <div className="journey-shell journey-stack-flow">
-          {stack.map(({ icon: Icon, ...item }, index) => (
-            <Link key={item.number} href={item.href} className="journey-stack-card" data-tone={item.tone}>
-              <div className="journey-stack-top"><span>{item.number}</span><Icon size={20} /></div>
-              <h3>{item.title}</h3>
-              <p>{item.text}</p>
-              <strong>进入这一层 <ArrowRight size={14} /></strong>
-              {index < stack.length - 1 && <i className="journey-stack-link" aria-hidden="true" />}
-            </Link>
+        <div className="home-shell stage-flow">
+          {stages.map(({ glyph, title, text, bg, color }) => (
+            <article key={title}>
+              <span>{glyph}</span>
+              <div className="flow-symbol" style={{ background: bg, color: color ?? '#f0f0ff' }}>{glyph}</div>
+              <h3>{title}</h3>
+              <p>{text}</p>
+            </article>
           ))}
+          <i aria-hidden="true"><ArrowRight /></i>
         </div>
       </section>
 
-      <section className="journey-section journey-route-section">
-        <div className="journey-shell journey-route-layout">
-          <div className="journey-route-intro">
-            <p className="journey-section-kicker">CHOOSE YOUR ENTRY POINT</p>
-            <h2>从你现在卡住的地方出发。</h2>
-            <p>不必按目录硬啃。先选当前目标，路线会告诉你先读什么、接着写什么、用什么测试确认理解。</p>
+      {/* ── Chapter grid ── */}
+      <section className="home-section chapter-section">
+        <div className="home-shell">
+          <div className="section-heading centered">
+            <p className="section-kicker">A COURSE IN DEPENDENCY ORDER</p>
+            <h2>五个阶段，一条因果链。</h2>
+            <p>每个阶段先建立最小心智模型，再进入对应讲义、源码与作业。后面的知识始终能指回前面的不变量。</p>
           </div>
-          <LearningRouteSelector />
-        </div>
-      </section>
-
-      <section className="journey-section journey-assignment-section">
-        <div className="journey-shell">
-          <div className="journey-section-heading">
-            <div>
-              <p className="journey-section-kicker">BUILD, RUN, EXPLAIN</p>
-              <h2>五次作业，五件能运行的作品。</h2>
-            </div>
-            <p>每章从接口契约开始，给出完整实现与代码解读，再用官方测试、最小实验和排错路径闭环。</p>
-          </div>
-          <div className="journey-assignment-grid">
-            {assignments.map(({ icon: Icon, ...item }) => (
-              <Link key={item.id} href={item.href} className="journey-assignment-card">
-                <div><span>{item.id}</span><Icon size={19} /></div>
-                <small>{item.title}</small>
-                <h3>{item.result}</h3>
-                <strong>进入工坊 <ArrowRight size={14} /></strong>
+          <div className="chapter-grid">
+            {chapters.map(({ icon: Icon, ...chapter }) => (
+              <Link key={chapter.number} href={chapter.href} className="chapter-card" data-tone={chapter.tone}>
+                <div className="chapter-top"><span>{chapter.number}</span><Icon size={21} /></div>
+                <h3>{chapter.title}</h3>
+                <p>{chapter.text}</p>
+                <strong>进入章节 <ArrowRight size={15} /></strong>
               </Link>
             ))}
           </div>
         </div>
       </section>
 
-      <section className="journey-section journey-evidence-section">
-        <div className="journey-shell journey-evidence-card">
-          <div><span className="journey-evidence-stamp">READ<br />BUILD<br />VERIFY</span></div>
-          <div>
-            <p className="journey-section-kicker">THE LEARNING CONTRACT</p>
-            <h2>概念要能推导，代码要能运行，结论要能复现。</h2>
-            <p>每个陌生缩写先解释，每段关键代码说明输入、输出和不变量；论文结论、课程要求与工程经验分开标注，并回到源码和测试核对。</p>
-            <div className="journey-evidence-points">
-              <span><Check size={14} /> 术语首次出现即解释</span>
-              <span><Check size={14} /> 公式配张量形状</span>
-              <span><Check size={14} /> 实现配测试与排错</span>
-            </div>
+      {/* ── Path selector ── */}
+      <section className="home-section">
+        <div className="home-shell path-layout">
+          <div className="path-intro">
+            <p className="section-kicker">CHOOSE YOUR ROUTE</p>
+            <h2>你不需要按目录硬啃。</h2>
+            <p>告诉我你现在更像哪一种学习者，得到一条有明确终点和检验方式的阅读顺序。随时可以切换。</p>
           </div>
-          <Link className="journey-button journey-button-light" href="/docs/resources/coverage">
-            查看课程地图 <ArrowRight size={17} />
+          <PathSelector />
+        </div>
+      </section>
+
+      {/* ── Assignment workbench ── */}
+      <section className="assignment-section">
+        <div className="home-shell">
+          <div className="split-heading" style={{ marginBottom: 46 }}>
+            <div>
+              <p className="section-kicker">ASSIGNMENT WORKBENCH</p>
+              <h2>读完一道题，<br />就把它做成。</h2>
+            </div>
+            <p>题面译文、必要先修、完整实现、逐段解释与测试结果按同一顺序出现，不需要在答案和题目之间来回翻找。</p>
+          </div>
+          <div className="assignment-ledger">
+            <div className="assignment-header" aria-hidden="true">
+              <span>LAB</span><span>TOPIC</span><span>DELIVERABLE</span><span>VERIFICATION</span><span />
+            </div>
+            {assignments.map((item) => (
+              <Link key={item.id} href={item.href} className="assignment-row">
+                <b>{item.id}</b>
+                <span>{item.title}</span>
+                <strong>{item.result}</strong>
+                <em><Check size={13} /> {item.tests}</em>
+                <ArrowRight size={18} />
+              </Link>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* ── Method card ── */}
+      <section className="evidence-section">
+        <div className="home-shell evidence-card">
+          <div>
+            <span className="evidence-stamp">READ<br />TRACE<br />TEST</span>
+          </div>
+          <div>
+            <p className="section-kicker">A REPEATABLE METHOD</p>
+            <h2>公式旁边就是 shape，实现通过课程测试，题面与讲义逐段对照。</h2>
+            <p>
+              遇到陌生算法时，先确认输入、输出、shape 与不变量；接着跟一次最小样例的执行路径；
+              最后用测试区分「看起来合理」和「实现正确」。
+            </p>
+          </div>
+          <Link className="button button-light" href="/docs/foundations">
+            补齐必要先修 <ArrowRight size={17} />
           </Link>
         </div>
       </section>
 
-      <footer className="journey-footer">
-        <div className="journey-shell">
-          <span>CS336 Learning Journey</span>
-          <p>Tokenize the text. Build the model. Scale the system.</p>
-          <Link href="/docs">打开完整文档 <ArrowRight size={14} /></Link>
+      {/* ── Footer ── */}
+      <footer className="home-footer">
+        <div className="home-shell">
+          <span>CS336 / Language Modeling from Scratch</span>
+          <p>Read the lecture. Trace the source. Make the test pass.</p>
+          <Link href="/docs">打开文档目录 <ArrowRight size={14} /></Link>
         </div>
       </footer>
     </main>

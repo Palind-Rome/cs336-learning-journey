@@ -1,84 +1,85 @@
 'use client';
 
 import Link from 'next/link';
-import { ArrowRight, BookOpen, Braces, Cpu, Wrench } from 'lucide-react';
+import { ArrowRight, BookOpen, Braces, Check, Cpu, Wrench } from 'lucide-react';
 import { useState } from 'react';
 
-const consoleStages = [
+const lifecycle = [
   {
-    key: 'tokenize',
-    label: '① 文本切成 token',
-    title: 'TOKENIZER / BYTE-LEVEL BPE',
-    note: 'Unicode 先编码成 UTF-8 bytes，再按 BPE merge 顺序合并；任何文本因此都有表示。',
-    tokens: [
-      { piece: 'Once', id: 7912, width: 84, tone: 'lime' },
-      { piece: ' upon', id: 2461, width: 62, tone: 'violet' },
-      { piece: ' a', id: 257, width: 38, tone: 'orange' },
-      { piece: ' time', id: 892, width: 52, tone: 'blue' },
-    ],
-    target: '输入形状 [B, T] = [1, 4]',
+    key: 'text',
+    label: 'Text',
+    title: '原始文本',
+    token: '"你好"',
+    note: '模型不直接看见「字」。先用确定的编码把 code point 变成 bytes，才有覆盖任意文本的有限字母表。',
   },
   {
-    key: 'forward',
-    label: '② 模型预测',
-    title: 'TRANSFORMER / NEXT TOKEN',
-    note: 'Embedding、RoPE 自注意力与 SwiGLU 逐层改写 residual stream，LM head 输出完整词表 logits。',
-    tokens: [
-      { piece: 'girl', id: 1843, width: 58, tone: 'lime' },
-      { piece: 'boy', id: 2234, width: 27, tone: 'violet' },
-      { piece: 'dragon', id: 6148, width: 11, tone: 'orange' },
-      { piece: 'house', id: 3921, width: 4, tone: 'blue' },
-    ],
-    target: 'logits 形状 [B, T, V] = [1, 4, 10,000]',
+    key: 'token',
+    label: 'Tokenize',
+    title: 'BPE 编码',
+    token: '[6,372, 8,401]',
+    note: '频繁相邻的 byte pair 被反复合并成新 token。merge 的顺序本身也定义了编码规则——冲突时先试先合并的 pair。',
   },
   {
-    key: 'learn',
-    label: '③ 损失与更新',
-    title: 'CROSS ENTROPY / ADAMW',
-    note: '正确下一个 token 是 “girl”。交叉熵只读取目标位置的 log-prob，AdamW 再更新所有参与计算的参数。',
-    tokens: [
-      { piece: 'girl · after', id: 1843, width: 73, tone: 'lime' },
-      { piece: 'girl · before', id: 1843, width: 38, tone: 'violet' },
-      { piece: 'loss', id: 0, width: 31, tone: 'orange' },
-      { piece: 'grad norm', id: 0, width: 46, tone: 'blue' },
-    ],
-    target: '一次 step：forward → loss → backward → clip → AdamW',
+    key: 'tensor',
+    label: 'Forward',
+    title: '前向传播',
+    token: '[B,T,V] logits',
+    note: 'token ids 经过 Embedding、Attention、MLP 变成词表上的分数。每层传递的是 [B,T,D] 张量，Attention 混合位置，MLP 改写道。',
+  },
+  {
+    key: 'loss',
+    label: 'Loss',
+    title: '学习信号',
+    token: 'CE = 2.31',
+    note: '序列右移一位就是 target。交叉熵告诉模型应该抬高哪个 token 的概率——不需要人工标注类别。',
+  },
+  {
+    key: 'system',
+    label: 'System',
+    title: '高效训练',
+    token: '312 TFLOP/s',
+    note: '同一数学结果被重新安排到 GPU 集群。fused kernel、FSDP 与 overlap 让昂贵硬件少等待，但不改变模型语义。',
+  },
+  {
+    key: 'behavior',
+    label: 'Align',
+    title: '后训练',
+    token: 'p(answer|q)',
+    note: '后训练没有凭空增加「回答模块」。它仍然更新 next-token policy，只是数据来源、reward 与评测目标发生了变化。',
   },
 ] as const;
 
-export function TokenJourneyConsole() {
+export function HeroConsole() {
   const [active, setActive] = useState(0);
-  const stage = consoleStages[active];
+  const stage = lifecycle[active];
 
   return (
-    <div className="journey-console">
-      <div className="journey-console-chrome">
-        <div aria-hidden="true"><i /><i /><i /></div>
-        <span>train_step / sample_0007</span>
-        <b>LIVE</b>
+    <div className="hero-console">
+      <div className="console-chrome">
+        <div><i /><i /><i /></div>
+        <span>model_lifecycle / stage_{String(active + 1).padStart(2, '0')}</span>
+        <b>TRACE</b>
       </div>
-      <div className="journey-console-prompt">
-        <span>PROMPT</span>
-        <p>Once upon a time there was a little</p>
+      <div className="console-body">
+        <p>
+          <strong>{stage.title}</strong> — {stage.note}
+        </p>
       </div>
-      <div className="journey-console-title">
-        <span>{stage.title}</span>
-        <code>{stage.target}</code>
+      <div style={{ padding: '8px 18px 0' }}>
+        <div style={{
+          display: 'inline-block',
+          padding: '6px 10px',
+          border: '1px solid var(--lab-line)',
+          borderRadius: 6,
+          fontFamily: 'var(--lab-mono)',
+          fontSize: 11,
+          color: 'var(--lab-ink)',
+        }}>
+          {stage.token}
+        </div>
       </div>
-      <div className="journey-token-list">
-        {stage.tokens.map((token) => (
-          <div className="journey-token-row" key={`${stage.key}-${token.piece}`}>
-            <strong>{token.piece}</strong>
-            <div className="journey-token-bar">
-              <i data-tone={token.tone} style={{ width: `${token.width}%` }} />
-              <em>{stage.key === 'tokenize' ? `id ${token.id}` : `${token.width}%`}</em>
-            </div>
-          </div>
-        ))}
-      </div>
-      <div className="journey-console-note"><span>↳</span><p>{stage.note}</p></div>
-      <div className="journey-console-tabs" role="tablist" aria-label="一次语言模型训练步骤">
-        {consoleStages.map((item, index) => (
+      <div className="console-stages" role="tablist" aria-label="模型生命周期">
+        {lifecycle.map((item, index) => (
           <button
             key={item.key}
             role="tab"
@@ -93,68 +94,64 @@ export function TokenJourneyConsole() {
   );
 }
 
-const routes = [
+const paths = [
   {
-    key: 'first',
+    key: 'course',
     label: '第一次系统学习',
     icon: BookOpen,
-    title: '先建立一条不会断的知识链',
-    description: '从 Python / 张量 / 概率先修开始，随后把 tokenizer、Transformer、训练与生成串成闭环。',
-    steps: ['补齐张量与概率先修', '看懂 byte-level BPE', '手算一次 attention', '训练第一个 TinyStories LM'],
-    href: '/docs/roadmap',
+    title: '先完成一条最小闭环',
+    steps: ['读：先修知识与 Lectures 1–4', '写：A1 的 tokenizer 与 Transformer', '验：训练 TinyStories 并解释生成轨迹'],
+    href: '/docs/foundations',
   },
   {
-    key: 'builder',
+    key: 'assignment',
     label: '准备完成作业',
     icon: Wrench,
-    title: '按测试依赖顺序写出完整系统',
-    description: '每一步都给出实现、形状、逐段解读、测试命令和典型失败，不把关键代码留作“自行完成”。',
-    steps: ['A1：模型与训练', 'A2：kernel 与并行', 'A3：缩放律实验', 'A4/A5：数据与对齐'],
+    title: '按题目依赖，而不是 PDF 页码写代码',
+    steps: ['读：当前题目与最小心智模型', '写：完整参考实现并逐段复述', '验：官方测试、边界样例与失败症状'],
     href: '/docs/assignments',
   },
   {
-    key: 'systems',
-    label: '想吃透工程',
+    key: 'source',
+    label: '想深入系统源码',
     icon: Cpu,
-    title: '从 FLOPs 走到真实 GPU 时间',
-    description: '沿 profiler、Triton、FlashAttention、DDP/FSDP 与推理 KV cache，理解性能瓶颈为何出现。',
-    steps: ['算术强度与 roofline', '写 fused Triton kernel', '拆解 FlashAttention', '分析通信与推理吞吐'],
-    href: '/docs/systems/gpu-kernels',
+    title: '沿数据搬运路径读系统代码',
+    steps: ['画：HBM ↔ SRAM ↔ Tensor Core', '测：benchmark 后再 profile', '改：保持数值 oracle，不破坏语义'],
+    href: '/docs/systems',
   },
-] as const;
+];
 
-export function LearningRouteSelector() {
-  const [active, setActive] = useState<(typeof routes)[number]['key']>('first');
-  const route = routes.find((item) => item.key === active) ?? routes[0];
+export function PathSelector() {
+  const [active, setActive] = useState('course');
+  const path = paths.find((item) => item.key === active) ?? paths[0];
 
   return (
-    <div className="journey-route-picker">
-      <div className="journey-route-tabs" role="tablist" aria-label="选择学习路线">
-        {routes.map(({ key, label, icon: Icon }) => (
+    <div className="path-picker">
+      <div className="path-tabs" role="tablist" aria-label="选择学习路线">
+        {paths.map(({ key, label, icon: Icon }) => (
           <button key={key} role="tab" aria-selected={key === active} onClick={() => setActive(key)}>
             <Icon size={16} /> {label}
           </button>
         ))}
       </div>
-      <div className="journey-route-panel">
+      <div className="path-panel">
         <span>RECOMMENDED ROUTE</span>
-        <h3>{route.title}</h3>
-        <p>{route.description}</p>
+        <h3>{path.title}</h3>
         <ol>
-          {route.steps.map((step, index) => <li key={step}><b>{index + 1}</b>{step}</li>)}
+          {path.steps.map((step, index) => <li key={step}><b>{index + 1}</b>{step}</li>)}
         </ol>
-        <Link href={route.href}>沿这条路线开始 <ArrowRight size={16} /></Link>
+        <Link href={path.href}>从这里出发 <ArrowRight size={16} /></Link>
       </div>
     </div>
   );
 }
 
-export function CodeProofStrip() {
+export function ProofLedger() {
   return (
-    <div className="journey-code-proof" aria-label="课程实现原则">
-      <span><Braces size={14} /> 公式紧贴张量形状</span>
-      <span><Cpu size={14} /> 代码经过官方测试核对</span>
-      <span><BookOpen size={14} /> 讲义逐讲对照</span>
+    <div className="hero-proof" aria-label="课程特点">
+      <span><Braces size={14} /> 公式旁边就是 shape</span>
+      <span><Check size={14} /> 实现通过课程测试</span>
+      <span><BookOpen size={14} /> 题面与讲义逐段对照</span>
     </div>
   );
 }
