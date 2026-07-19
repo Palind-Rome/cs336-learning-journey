@@ -926,15 +926,17 @@ $$N_{DP}\le 1+\frac{BW}{C}.$$
 
 ### 7.4 FSDP
 
-forward 先 all-gather 权重，backward 既 all-gather 权重又 reduce-scatter 梯度：
+forward 先 all-gather 权重：
 
 $$T^{fwd}_{comp}=\frac{6BDD_{FF}}{N_{FSDP}C},\quad
-T^{fwd}_{comm}=\frac{N_{FSDP}-1}{N_{FSDP}}\frac{6DD_{FF}}{W},$$
+T^{fwd}_{comm}=\frac{N_{FSDP}-1}{N_{FSDP}}\frac{6DD_{FF}}{W}.$$
+
+backward 既 all-gather 权重又 reduce-scatter 梯度：
 
 $$T^{bwd}_{comp}=\frac{12BDD_{FF}}{N_{FSDP}C},\quad
 T^{bwd}_{comm}=2\frac{N_{FSDP}-1}{N_{FSDP}}\frac{6DD_{FF}}{W}.$$
 
-两边都得到 $N_{FSDP}\le1+BW/C$。FSDP 省显存，却比普通 DP 在 forward 多了权重通信；能否提前 prefetch 并覆盖它决定实际吞吐。
+两边都得到 $N_{FSDP}\le1+BW/C$。
 
 ### 7.5 TP
 
@@ -969,9 +971,8 @@ $$T_{comp}=\frac{6BDD_{FF}}{N_{TP}N_{FSDP}C}.$$
 
 FSDP 轴只搬运当前 TP shard 的权重，TP 轴只搬运当前 FSDP batch shard 的 activation：
 
-$$T_{FSDP}=\frac{N_{FSDP}-1}{N_{FSDP}}\frac{6DD_{FF}}{N_{TP}W},$$
-
-$$T_{TP}=2\frac{N_{TP}-1}{N_{TP}}\frac{2BD}{N_{FSDP}W}.$$
+$$T_{FSDP}=\frac{N_{FSDP}-1}{N_{FSDP}}\frac{6DD_{FF}}{N_{TP}W},\qquad
+T_{TP}=2\frac{N_{TP}-1}{N_{TP}}\frac{2BD}{N_{FSDP}W}.$$
 
 若两条网络轴可以重叠，通信关键路径是 `max(T_FSDP, T_TP)`，可分别把两轴推到：
 
