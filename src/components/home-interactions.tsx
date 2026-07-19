@@ -65,18 +65,8 @@ export function HeroConsole() {
           <strong>{stage.title}</strong> — {stage.note}
         </p>
       </div>
-      <div style={{ padding: '8px 18px 0' }}>
-        <div style={{
-          display: 'inline-block',
-          padding: '6px 10px',
-          border: '1px solid var(--lab-line)',
-          borderRadius: 6,
-          fontFamily: 'var(--lab-mono)',
-          fontSize: 11,
-          color: 'var(--lab-ink)',
-        }}>
-          {stage.token}
-        </div>
+      <div className="console-token">
+        <code>{stage.token}</code>
       </div>
       <div className="console-stages" role="tablist" aria-label="模型生命周期">
         {lifecycle.map((item, index) => (

@@ -1,7 +1,7 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { ArrowRight, Check, Circle, Info, RotateCcw } from 'lucide-react';
+import { ArrowRight, Check, Circle, Info, RotateCcw, X } from 'lucide-react';
 import type { ReactNode } from 'react';
 
 /* ──  TensorShapeLab  ── */
@@ -71,33 +71,36 @@ export function ScalingLab() {
 /* ──  CheckpointQuiz  ── */
 export function CheckpointQuiz({ question, options, answer, explanation }: { question: string; options: string[]; answer: number; explanation: string }) {
   const [picked, setPicked] = useState<number | null>(null);
+  const isCorrect = picked === answer;
 
   return (
     <div className="checkpoint-quiz">
-      <div className="checkpoint-quiz-label">理解检查</div>
-      <p className="my-3.5 font-semibold">{question}</p>
-      <div className="grid gap-2.5">
-        {options.map((option, index) => (
-          <button
-            key={option}
-            onClick={() => setPicked(index)}
-            disabled={picked !== null}
-            className={`rounded-lg border px-4 py-3 text-left text-sm transition ${
-              picked === index
-                ? (index === answer ? 'border-emerald-600 bg-emerald-500/10' : 'border-red-500 bg-red-500/10')
-                : 'border-fd-border hover:bg-fd-accent'
-            }`}
-          >
-            {option}
-          </button>
-        ))}
+      <div className="checkpoint-quiz-head">
+        <div>
+          <span>CHECKPOINT</span>
+          <h3>理解检查</h3>
+        </div>
       </div>
-      {picked !== null && (
-        <p className="mt-4 flex items-start gap-2 text-sm">
-          <Check size={16} className={`mt-0.5 shrink-0 ${picked === answer ? 'text-emerald-600' : 'text-red-500'}`} />
-          <span><b>{picked === answer ? '答对了。' : '再想想。'}</b> {explanation}</span>
-        </p>
-      )}
+      <div className="checkpoint-quiz-body">
+        <p>{question}</p>
+        <div className="quiz-options">
+          {options.map((option, index) => (
+            <button
+              key={option}
+              onClick={() => setPicked(index)}
+              className={`q-pick-btn${picked === index ? ' q-picked' : ''}${picked !== null && index === answer ? ' q-correct' : ''}`}
+            >
+              {option}
+            </button>
+          ))}
+        </div>
+        {picked !== null && (
+          <div className="checkpoint-quiz-feedback">
+            {isCorrect ? <Check size={15} className="inline text-emerald-600 mr-2" /> : <X size={15} className="inline text-red-500 mr-2" />}
+            <b>{isCorrect ? '答对了。' : '再想想。'}</b>{' '}{explanation}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

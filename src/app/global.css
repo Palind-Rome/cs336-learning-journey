@@ -299,7 +299,7 @@ body {
 }
 
 .console-body {
-  padding: 18px;
+  padding: 18px 18px 0;
 }
 
 .console-body p {
@@ -311,6 +311,22 @@ body {
 
 .console-body p strong {
   color: var(--lab-ink);
+}
+
+.console-token {
+  padding: 14px 18px 18px;
+  border-bottom: 1px solid var(--lab-line);
+}
+
+.console-token code {
+  display: inline-block;
+  padding: 7px 11px;
+  border: 1px solid var(--lab-line);
+  border-radius: 7px;
+  background: var(--lab-card);
+  color: var(--lab-ink);
+  font-family: var(--lab-mono);
+  font-size: 11px;
 }
 
 .console-stages {
@@ -404,13 +420,13 @@ body {
   display: grid;
   grid-template-columns: 1fr auto 1fr auto 1fr;
   gap: 22px;
-  align-items: start;
+  align-items: center;
   margin-top: 64px;
 }
 
 .stage-flow article {
   position: relative;
-  min-height: 260px;
+  min-height: 270px;
   padding: 28px;
   border: 1px solid var(--lab-line);
   border-radius: 14px;
@@ -462,8 +478,9 @@ body {
 }
 
 .stage-flow > i {
+  display: grid;
+  place-items: center;
   color: var(--lab-muted);
-  margin-top: 114px;
 }
 
 /* Chapter grid */
@@ -1147,30 +1164,59 @@ body {
 /* ──  CheckpointQuiz  ── */
 .checkpoint-quiz {
   margin: 2rem 0;
+  overflow: hidden;
   border: 1px solid var(--lab-line);
   border-radius: 14px;
   background: var(--lab-card);
-  padding: 24px;
-  border-left: 4px solid var(--lab-amber);
+  box-shadow: 7px 7px 0 color-mix(in srgb, var(--lab-ink) 6%, transparent);
   color: var(--lab-ink);
   font-family: var(--lab-sans);
 }
 
-.checkpoint-quiz-label {
+.checkpoint-quiz-head {
+  display: flex;
+  min-height: 74px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--lab-line);
+}
+
+.checkpoint-quiz-head span {
+  display: block;
+  margin-bottom: 4px;
   color: var(--lab-muted);
   font-family: var(--lab-mono);
   font-size: 9px;
   font-weight: 800;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.14em;
 }
 
-.checkpoint-quiz p {
-  margin: 14px 0;
+.checkpoint-quiz-head h3 {
+  margin: 0;
+  font-family: var(--lab-serif);
+  font-size: 22px;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+}
+
+.checkpoint-quiz-body {
+  padding: 24px 20px;
+}
+
+.checkpoint-quiz-body p {
+  margin: 0 0 18px;
   font-size: 15px;
   font-weight: 650;
 }
 
-.checkpoint-quiz button {
+.checkpoint-quiz-body .quiz-options {
+  display: grid;
+  gap: 8px;
+}
+
+.checkpoint-quiz-body button {
   width: 100%;
   text-align: left;
   padding: 11px 14px;
@@ -1179,11 +1225,37 @@ body {
   color: var(--lab-ink);
   font-size: 13px;
   cursor: pointer;
-  transition: background 0.15s ease;
+  transition: background 0.15s ease, border-color 0.15s ease;
 }
 
-.checkpoint-quiz button:hover {
+.checkpoint-quiz-body button:hover {
   background: var(--color-fd-accent);
+}
+
+.checkpoint-quiz-body button.q-picked {
+  border-color: var(--lab-ink);
+  background: color-mix(in srgb, var(--lab-indigo) 14%, transparent);
+  color: var(--lab-ink);
+  font-weight: 700;
+}
+
+.checkpoint-quiz-body button.q-correct {
+  border-color: color-mix(in srgb, #22c55e 60%, var(--lab-ink));
+}
+
+.checkpoint-quiz-feedback {
+  margin-top: 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--lab-line);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--lab-amber) 10%, transparent);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--lab-muted);
+}
+
+.checkpoint-quiz-feedback b {
+  color: var(--lab-ink);
 }
 
 /* ──  SourceBrief  ── */
@@ -1193,7 +1265,7 @@ body {
   border: 1px solid var(--lab-line);
   border-radius: 14px;
   background: var(--lab-card);
-  border-left: 4px solid var(--lab-indigo);
+  box-shadow: 7px 7px 0 color-mix(in srgb, var(--lab-ink) 6%, transparent);
   color: var(--lab-ink);
   font-family: var(--lab-sans);
 }
@@ -1240,7 +1312,7 @@ body {
   border: 1px solid var(--lab-line);
   border-radius: 14px;
   background: var(--lab-card);
-  border-left: 4px solid var(--lab-teal);
+  box-shadow: 7px 7px 0 color-mix(in srgb, var(--lab-ink) 6%, transparent);
   color: var(--lab-ink);
   font-family: var(--lab-sans);
 }
@@ -1529,12 +1601,11 @@ body {
 
   .stage-flow {
     grid-template-columns: 1fr;
+    gap: 12px;
   }
 
   .stage-flow > i {
     transform: rotate(90deg);
-    justify-self: center;
-    margin-top: 0;
   }
 
   .stage-flow article {
