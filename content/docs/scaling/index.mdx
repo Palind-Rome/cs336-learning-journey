@@ -1,0 +1,56 @@
+---
+title: 03 · 缩放与推理
+description: 把有限计算预算变成可检验的模型、数据与部署决策，而不是凭经验猜一次昂贵训练。
+---
+
+Scaling law 不是一句“模型越大越好”，而是一种决策流程：在较小预算下系统改变模型参数量 $N$、训练 token 数 $D$ 与 recipe，测量 loss，再外推更大预算下的候选配置。
+
+```text
+预算 C
+  → 设计多个 (N, D, shape, recipe) 小实验
+  → 找到每个 C 下的最低 loss
+  → 在 log 空间拟合趋势
+  → held-out 检查
+  → 加入显存、吞吐、延迟约束
+  → 选择真实可训练、可部署的配置
+```
+
+<ConceptBridge title="三个“最优”不是同一个问题">
+  **训练计算最优**是在固定 training FLOPs 下 loss 最低；**训练时间最优**还要考虑硬件利用率和通信；**部署最优**还要计入请求流量、KV cache、延迟与模型服务寿命。一个参数更少、训练 token 更多的模型可能训练更贵，却长期服务更便宜。
+</ConceptBridge>
+
+## 先固定符号
+
+| 符号 | 含义 | 不能偷偷改变的东西 |
+|---|---|---|
+| $N$ | 非 embedding 或约定口径下的模型参数量 | 参数统计口径 |
+| $D$ | 训练中实际消费的 token 数 | tokenizer 与数据重复方式 |
+| $C$ | 训练计算，常粗估为 $6ND$ | forward/backward 与架构 FLOPs 口径 |
+| $L$ | validation loss | 验证集、tokenizer、上下文和计算方法 |
+
+## 三讲怎样接起来
+
+1. **Lecture 9** 讲幂律、IsoFLOPs、Chinchilla 拟合与外推风险。
+2. **Lecture 10** 把训练后的模型放进 serving：prefill、decode、KV cache、量化与 speculative decoding。
+3. **Lecture 11** 研究 recipe 本身怎样随宽度迁移，包括 WSD、μP 与 Muon。
+
+随后用 [Scaling law 补充](/docs/scaling/laws)复习拟合细节，再在 [Assignment 3](/docs/assignments/assignment-3) 中用 12 B200-hours 的探索预算预测一次 48 B200-hours 配置。
+
+## 最小检查：为什么要留 held-out runs
+
+若所有 run 都参与拟合，再用这些点报告误差，只能证明优化器找到了贴合训练数据的参数。外推真正需要的是：暂时藏起一部分预算/shape，拟合后再预测它们。若近处都预测不准，远处的大训练更不可信。
+
+<CheckpointQuiz
+  question="一条 log-log 图上的直线能否证明大十万倍预算仍遵循同一幂律？"
+  options={['能，直线就是物理定律', '不能，它只支持已观测范围内的经验关系，远距外推还依赖 recipe 与数据分布稳定', '只要 R² 大于 0.9 就能', '只要模型都是 Transformer 就能']}
+  answer={1}
+  explanation="幂律是经验模型。数据质量、架构、optimizer、batch、训练阶段或评测口径改变，都可能让外推断裂。"
+/>
+
+## 完成本阶段时应能做到
+
+- 从固定 $C$ 的实验中找出 $N_{opt}$、$D_{opt}$ 并拟合幂律；
+- 区分插值、近距外推和远距外推的证据强度；
+- 把 prefill 与 decode 的算术强度、KV cache 与延迟分开核算；
+- 解释 μP 想迁移什么，以及为什么必须用 sweep 验证；
+- 将连续数学最优点落到合法层数、宽度、头数和训练步数。

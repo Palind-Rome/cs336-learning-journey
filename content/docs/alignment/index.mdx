@@ -1,0 +1,54 @@
+---
+title: 05 · 对齐与多模态
+description: 理解同一个 next-token 模型如何从续写走向指令跟随、偏好优化、可验证推理与视觉语言。
+---
+
+预训练模型已经会续写大量文本，却不一定稳定回答问题、遵守角色、使用工具或拒绝危险请求。Post-training 没有替换语言模型目标的基本接口；它改变的是**训练样本从哪里来、哪些 token 计 loss、怎样评价一条完整回答**。
+
+```text
+base LM
+  → instruction demonstrations → SFT policy
+  → chosen / rejected pairs    → DPO or reward model
+  → sampled rollouts + reward  → PPO / GRPO / RLVR
+  → capability + safety + calibration evaluation
+```
+
+<ConceptBridge title="先分清 token 监督与 trajectory 监督">
+  SFT 知道目标回答的每一个 token，因此可以直接 teacher forcing。偏好数据只说明两条完整回答谁更好；可验证奖励甚至只在整条数学答案结束后给 0/1。DPO、REINFORCE、GRPO 的核心工作，是把较稀疏的回答级信号变成可更新 token policy 的 loss。
+</ConceptBridge>
+
+## 四种训练信号放在同一张表里
+
+| 方法 | 数据 | 直接优化的量 | 最容易忽略的边界 |
+|---|---|---|---|
+| pretraining | 原始 token 序列 | next-token likelihood | 学到分布不等于遵循指令 |
+| SFT | prompt + target response | target token cross entropy | prompt token 通常不计 loss |
+| DPO | chosen / rejected | 相对 frozen reference 的偏好 margin | pair 质量与 reference 很关键 |
+| GRPO/RLVR | policy rollouts + reward | reward-weighted policy gradient | exploration、baseline、off-policy ratio |
+
+## 三讲怎样接起来
+
+1. **Lecture 15** 从 instruction data、SFT、reward model、PPO 走到 DPO 与安全对齐。
+2. **Lecture 16** 用可验证 reward 训练推理，推导 REINFORCE、GRPO、RFT、MaxRL 与 off-policy clipping。
+3. **Lecture 17** 把文本 token 主线扩展到图像与视频：continuous encoder、projector、视觉 token 与统一生成。
+
+[后训练补充](/docs/alignment/post-training)先整理目标函数；[Assignment 5](/docs/assignments/assignment-5)完整实现 prompting、grader、on/off-policy GRPO、GSPO、packed SFT 与 DPO。
+
+## 一个最小 policy-gradient 例子
+
+同一道题采四条回答，reward 为 `[1, 0, 0, 1]`，group mean 是 `0.5`。减去 baseline 后 advantage 为 `[+0.5, -0.5, -0.5, +0.5]`：训练提高两条正确轨迹 token 的 log-prob，降低两条错误轨迹。若四条全对或全错，组内相对信号为零；这就是为什么初始探索能力与题目难度分布直接决定学习能否开始。
+
+<CheckpointQuiz
+  question="GRPO 中同一题的所有 rollout reward 都是 0，会发生什么？"
+  options={['错误回答都会被强烈惩罚', '减去 group mean 后 advantage 全为 0，这组通常不提供 policy-gradient 更新', '模型自动切换成 SFT', 'reference model 给出正确答案']}
+  answer={1}
+  explanation="group-relative baseline 只能利用组内差异。没有任何成功样本时，必须靠更合适的 prompt、题目难度、采样或其他信号改善探索。"
+/>
+
+## 完成本阶段时应能做到
+
+- 从数据形式判断一项工作使用 imitation、preference 还是 reward 信号；
+- 推导 REINFORCE，并解释 baseline 为何降方差但不凭空产生信息；
+- 写对 response mask、per-token log-prob、importance ratio 与 clipping 符号；
+- 同时评估能力、帮助性、安全、长度与格式，识别 reward hacking；
+- 解释视觉 encoder、projector 与 causal LM 的 shape 和 token 预算。

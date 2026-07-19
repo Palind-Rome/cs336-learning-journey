@@ -1,1 +1,14 @@
-{"title":"04 · 数据：模型吃什么","pages":["pipeline"]}
+{
+  "title": "04 · 评测与数据（L12–14）",
+  "pagesIndex": "index",
+  "pages": [
+    "---课程讲义---",
+    "[Lecture 12 · 评测与测量](/docs/lectures/12-14-eval-data/#lecture-12评测是测量学不是排行榜)",
+    "[Lecture 13 · 数据来源](/docs/lectures/12-14-eval-data/#lecture-13训练数据从哪里来)",
+    "[Lecture 14 · 过滤、去重与混合](/docs/lectures/12-14-eval-data/#lecture-14把原始来源变成训练分布)",
+    "---概念与实现---",
+    "pipeline",
+    "[评测实践补充](/docs/resources/evaluation-multimodal)",
+    "[Assignment 4 · 完整流水线](/docs/assignments/assignment-4)"
+  ]
+}

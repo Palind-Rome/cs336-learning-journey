@@ -1,0 +1,61 @@
+---
+title: 04 · 评测与数据
+description: 先定义希望模型学会什么，再把原始来源变成可追溯、可比较、可训练的分布。
+---
+
+数据工程不是“下载更多网页”。每个抽取、过滤、去重、混合与 tokenize 决策都会改变模型最终看到的概率分布；评测则负责判断这种改变是否真的更接近目标。
+
+```text
+目标行为与风险
+  → evaluation protocol
+  → source selection
+  → bytes / HTML / WET
+  → text extraction
+  → language + quality + safety filters
+  → exact / fuzzy dedup
+  → source mixture
+  → tokenization
+  → fixed-recipe training
+  → 分域评测与样本审计
+```
+
+<ConceptBridge title="为什么先学评测，再学数据">
+  “高质量”不是网页自带的客观标签。若目标是代码能力、事实覆盖、多语言或安全性，保留规则和 mixture 会不同。Lecture 12 先让目标可测量，Lectures 13–14 才讨论该收集和保留哪些数据。
+</ConceptBridge>
+
+## 一条样本至少要有三层记录
+
+| 层 | 例子 | 用途 |
+|---|---|---|
+| 原始来源 | URL、WARC/WET 位置、抓取时间 | 追溯、授权与重跑 |
+| 决策证据 | language score、规则命中、classifier score、dedup cluster | 解释为什么留/丢 |
+| 训练表示 | tokenizer 版本、token offsets、EOS 边界、mixture weight | 复现模型实际输入 |
+
+只保留最终 `text` 会让失败无法归因：不知道是抽取丢内容、分类器偏差、阈值过严，还是 tokenize/拼接破坏了文档边界。
+
+## 三讲怎样接起来
+
+1. **Lecture 12** 把评测当测量学：construct、protocol、validity、污染与 grader。
+2. **Lecture 13** 追踪网页、书籍、代码、许可数据与合成数据从哪里来。
+3. **Lecture 14** 组合抽取、分类、启发式、去重、混合与 post-training data。
+
+[数据流水线补充](/docs/data/pipeline)给出关键算法地图；[Assignment 4](/docs/assignments/assignment-4)从 Common Crawl WET 出发实现一条有统计、有样本审计的流水线。
+
+## 最小实验为何必须固定训练 recipe
+
+比较过滤器 A 与 B 时，若同时改变模型宽度、训练步数或 learning rate，validation loss 的差异就无法归因于数据。A4 固定模型和训练预算，只替换 dataset；同时报告保留率、分域指标与具体样本，才能判断更低 loss 是否来自真正的数据改进，而不是删除了更难的分布。
+
+<CheckpointQuiz
+  question="一个 quality classifier 给网页 0.93 分，最稳妥的解释是什么？"
+  options={['网页有 93% 概率是绝对高质量', '在该模型与训练标签定义下，这个输入更像正类；仍需校准、阈值分析与样本审计', '网页没有版权风险', '网页一定能降低所有下游任务 loss']}
+  answer={1}
+  explanation="classifier score 继承训练数据与标签定义的偏差，不是跨目标、跨分布都成立的真值。"
+/>
+
+## 完成本阶段时应能做到
+
+- 写出评测的目标构念、样本、prompt、grader、聚合和不确定性；
+- 区分 WARC、WAT、WET 以及 bytes、Unicode、HTML 主文本；
+- 解释精确哈希、MinHash、LSH 各解决哪一级重复；
+- 为每个过滤器报告阈值、保留率、误杀/漏放样本与分域影响；
+- 让同一输入与配置可重放出相同训练 token 流。

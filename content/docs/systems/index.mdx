@@ -1,0 +1,61 @@
+---
+title: 02 · 系统与效率
+description: 在不改变数学结果的前提下，安排 GPU 计算、显存与通信，让同一模型真正跑得快。
+---
+
+第一阶段解决“算什么”，这一阶段解决“**在哪里算、数据怎样到达计算单元、什么时候通信**”。系统优化的正确性底线是：换了 kernel 或并行策略，模型仍应得到与单卡参考实现等价的结果。
+
+```text
+数学图：matmul → norm → attention → optimizer
+             ↓ 映射到硬件
+执行图：HBM ↔ SRAM/register ↔ Tensor Core ↔ network
+```
+
+<ConceptBridge title="先把 GPU 想成一座吞吐工厂">
+  Tensor Core 是速度极快的生产线，HBM 是远处仓库，片上 SRAM/register 是工位旁的小料架。若每做一点计算都回仓库拿材料，生产线再快也会闲着；tiling、fusion 与 FlashAttention 的共同目标，是让搬来的一块数据在片上多做一些有用工作。
+</ConceptBridge>
+
+## 进入性能代码前先分清四个指标
+
+| 指标 | 回答的问题 | 常见误用 |
+|---|---|---|
+| latency | 单次操作等多久 | 把异步 launch 时间当完整 GPU 时间 |
+| throughput | 单位时间完成多少 token/样本 | 忽略 batch 和 sequence 配置 |
+| memory | 峰值与常驻状态各占多少 | 只看参数，不看 activation/optimizer |
+| communication | 传多少 bytes、是否阻塞 | 只数 collective 次数，不看拓扑与 overlap |
+
+## 四讲怎样接起来
+
+1. **Lecture 5** 建立存储层次、算术强度、tiling 与 FlashAttention 直觉。
+2. **Lecture 6** 学会同步 benchmark、读 profiler，并把可读 oracle 改写成 Triton kernel。
+3. **Lecture 7** 把 broadcast、all-reduce、reduce-scatter、all-gather 等 collective 当成并行积木。
+4. **Lecture 8** 组合 ZeRO/FSDP、TP、PP、SP/CP 与 EP，理解真实训练拓扑。
+
+[GPU kernel 补充](/docs/systems/gpu-kernels)聚焦单卡，[分布式与推理补充](/docs/systems/distributed-inference)聚焦多卡与 serving；[Assignment 2](/docs/assignments/assignment-2)把两者压缩成可测试实现。
+
+## 每次优化都走同一个闭环
+
+```text
+写数值 oracle
+  → 选固定 shape/dtype/device
+  → warmup + synchronize + benchmark
+  → profiler 定位瓶颈
+  → 只改一个资源路径
+  → 对齐 forward / backward / distributed result
+  → 重新测量并记录适用范围
+```
+
+<CheckpointQuiz
+  question="CUDA kernel launch 后立刻读取 CPU 计时器，为什么经常得到虚假的超短时间？"
+  options={['GPU 使用了整数运算', 'CUDA 默认异步，CPU 只测到提交工作而非完成工作', '模型参数太少', 'Python 自动缓存了输出']}
+  answer={1}
+  explanation="计时边界需要 CUDA event 或显式 synchronize；否则 CPU 已继续向下执行，而 GPU 工作仍在队列中。"
+/>
+
+## 完成本阶段时应能做到
+
+- 用 roofline 语言判断算子偏 compute-bound 还是 memory-bound；
+- 解释 FlashAttention 为什么减少 HBM 流量但不近似 attention；
+- 画出 DDP、FSDP、TP、PP 的参数/activation/gradient 分布；
+- 为一次性能结论给出 shape、dtype、硬件、warmup、同步与统计方法；
+- 让优化实现与 PyTorch/单进程 oracle 在 forward 和 gradient 上对齐。

@@ -1,1 +1,15 @@
-{"title":"02 · 系统：让模型跑得快","pages":["gpu-kernels","distributed-inference"]}
+{
+  "title": "02 · 系统与效率（L5–8）",
+  "pagesIndex": "index",
+  "pages": [
+    "---课程讲义---",
+    "[Lecture 5 · GPU 与数据搬运](/docs/lectures/05-08-systems/#lecture-5把-gpu-看成数据搬运机器)",
+    "[Lecture 6 · Benchmark、Profiler 与 Triton](/docs/lectures/05-08-systems/#lecture-6正确-benchmark--profile--kernel)",
+    "[Lecture 7 · Collectives 与并行](/docs/lectures/05-08-systems/#lecture-7collective-是分布式算法的积木)",
+    "[Lecture 8 · ZeRO、FSDP 与多维并行](/docs/lectures/05-08-systems/#lecture-8从教学积木到生产拓扑)",
+    "---概念与实现---",
+    "gpu-kernels",
+    "distributed-inference",
+    "[Assignment 2 · 完整实现](/docs/assignments/assignment-2)"
+  ]
+}

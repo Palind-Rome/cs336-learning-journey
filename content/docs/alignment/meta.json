@@ -1,1 +1,14 @@
-{"title":"05 · 对齐：从续写到回答","pages":["post-training"]}
+{
+  "title": "05 · 对齐与多模态（L15–17）",
+  "pagesIndex": "index",
+  "pages": [
+    "---课程讲义---",
+    "[Lecture 15 · SFT 与偏好学习](/docs/lectures/15-17-alignment-multimodal/#lecture-15模型从续写变成助手)",
+    "[Lecture 16 · RLVR 与推理训练](/docs/lectures/15-17-alignment-multimodal/#lecture-16用可验证奖励训练推理)",
+    "[Lecture 17 · 视觉语言模型](/docs/lectures/15-17-alignment-multimodal/#lecture-17语言模型如何看见图像)",
+    "---概念与实现---",
+    "post-training",
+    "[多模态实践补充](/docs/resources/evaluation-multimodal)",
+    "[Assignment 5 · 完整实现](/docs/assignments/assignment-5)"
+  ]
+}

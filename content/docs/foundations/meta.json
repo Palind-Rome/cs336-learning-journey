@@ -1,4 +1,19 @@
 {
-  "title": "01 · 基础：从文本到模型",
-  "pages": ["prerequisites", "tokenization", "transformer", "training"]
+  "title": "01 · 基础与架构（L1–4）",
+  "pagesIndex": "index",
+  "defaultOpen": true,
+  "pages": [
+    "---开始这里---",
+    "prerequisites",
+    "---课程讲义---",
+    "[Lecture 1 · 全景与 BPE](/docs/lectures/01-04-basics/#lecture-1从课程全景走到-bpe)",
+    "[Lecture 2 · 资源核算](/docs/lectures/01-04-basics/#lecture-2资源核算是一种调试语言)",
+    "[Lecture 3 · 现代 Transformer](/docs/lectures/01-04-basics/#lecture-3从-2017-transformer-到现代-decoder)",
+    "[Lecture 4 · 长序列、SSM 与 MoE](/docs/lectures/01-04-basics/#lecture-4两条扩展路径)",
+    "---概念与实现---",
+    "tokenization",
+    "transformer",
+    "training",
+    "[Assignment 1 · 完整实现](/docs/assignments/assignment-1)"
+  ]
 }

@@ -1,0 +1,77 @@
+---
+title: 01 · 基础与架构
+description: 用四讲建立语言模型最小闭环：文本变成 token，token 变成 logits，误差再变成参数更新。
+---
+
+这一阶段只追一个问题：**给定一段文本，模型究竟经过哪些确定步骤，才会更擅长预测下一个 token？**
+
+先把完整闭环放在眼前：
+
+```text
+Unicode string
+  → UTF-8 bytes
+  → BPE token ids [B,T]
+  → token embeddings [B,T,D]
+  → N × Transformer block
+  → vocabulary logits [B,T,V]
+  → cross entropy
+  → gradients
+  → AdamW 更新参数
+```
+
+后面出现的 RMSNorm、RoPE、SwiGLU、MoE 都只是这条链上的部件。先知道部件接在哪里，再研究它为什么这样设计。
+
+<ConceptBridge title="第一次读模型代码，只追四样东西">
+  1. **对象是什么**：整数 id、浮点张量、参数，还是标量 loss？
+  2. **shape 是什么**：每个轴分别代表 batch、time、feature、head 还是 vocabulary？
+  3. **信息从哪里来**：当前位置能否读取未来 token？不同样本有没有意外混在一起？
+  4. **什么必须保持不变**：encode/decode 可逆、causal mask 正确、残差输入输出同 shape、checkpoint 可恢复训练状态。
+</ConceptBridge>
+
+## 进入本阶段前的最小词典
+
+| 名称 | 先这样理解 | 之后在哪里落实 |
+|---|---|---|
+| token | 模型一次读取或预测的离散整数单位 | Lecture 1、BPE、A1 tokenizer |
+| embedding | 用 token id 查到的一行可学习向量 | Lecture 3、A1 `Embedding` |
+| logits | softmax 之前、对词表每个候选的原始分数 | Transformer、cross entropy |
+| parameter | 会被 optimizer 更新的持久张量 | `nn.Parameter`、AdamW |
+| activation | 当前 batch 前向计算产生的临时张量 | 反向传播、显存核算 |
+| gradient | loss 对参数的局部变化率 | `backward()`、gradient clipping |
+
+## 四讲怎样接起来
+
+1. **Lecture 1** 定义输入：Unicode、UTF-8、byte-level BPE 与 tokenizer 契约。
+2. **Lecture 2** 建立资源账本：shape、dtype、参数、activation、FLOPs 与 HBM。
+3. **Lecture 3** 组装现代 decoder-only Transformer，并解释各部件的稳定性与资源取舍。
+4. **Lecture 4** 讨论两条扩展路线：改变序列混合方式，或让 FFN 变成稀疏 MoE。
+
+建议顺序是：先读[必要先修](/docs/foundations/prerequisites)，再顺序完成四讲；遇到具体实现时打开 [tokenization](/docs/foundations/tokenization)、[Transformer](/docs/foundations/transformer) 和[训练循环](/docs/foundations/training)作横向补充，最后进入 [Assignment 1](/docs/assignments/assignment-1)。
+
+## 一个最小样例
+
+假设序列是 `[A, B, C]`。训练时输入 `[A, B]`，target 是 `[B, C]`：
+
+```text
+position        0        1
+input           A        B
+target          B        C
+model asks   P(?|A)   P(?|A,B)
+```
+
+causal attention 让位置 0 不能偷看 `B`，位置 1 不能偷看 `C`。交叉熵分别惩罚没有给 `B`、`C` 足够概率的预测，再把两处误差平均。整门课的预训练目标就建立在这个简单错位上。
+
+<CheckpointQuiz
+  question="为什么训练输入和 target 要错开一位？"
+  options={['为了减少词表大小', '为了让每个位置用前缀预测紧随其后的 token', '为了让 attention 能读取未来', '为了省掉 embedding']}
+  answer={1}
+  explanation="自回归 LM 学的是 p(x_t | x_{<t})。同一条序列错开一位，就能同时得到多个 next-token 监督信号。"
+/>
+
+## 完成本阶段时应能做到
+
+- 随手写出 `[B,T] → [B,T,D] → [B,H,T,d_h] → [B,T,V]`，并解释每个轴；
+- 说明 byte-level BPE 为什么既能覆盖任意文本，又能压缩常见片段；
+- 从公式和代码两边解释 RMSNorm、RoPE、attention 与 SwiGLU；
+- 在一个 batch 上完成 forward、loss、backward、clip、AdamW 和 checkpoint；
+- 对一次错误预测追到具体 token、logit、loss 与参数更新。

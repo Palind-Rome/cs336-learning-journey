@@ -1,1 +1,13 @@
-{"title":"03 · 缩放：小实验预测大训练","pages":["laws"]}
+{
+  "title": "03 · 缩放与推理（L9–11）",
+  "pagesIndex": "index",
+  "pages": [
+    "---课程讲义---",
+    "[Lecture 9 · Scaling laws](/docs/lectures/09-11-scaling/#lecture-9scaling-law-在测什么)",
+    "[Lecture 10 · 推理系统与压缩](/docs/lectures/09-11-scaling/#lecture-10推理为何与训练不同)",
+    "[Lecture 11 · Recipe、μP 与 Muon](/docs/lectures/09-11-scaling/#lecture-11scaling-recipe-自己也要可缩放)",
+    "---概念与实现---",
+    "laws",
+    "[Assignment 3 · 完整实验](/docs/assignments/assignment-3)"
+  ]
+}
