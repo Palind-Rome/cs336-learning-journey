@@ -14,21 +14,30 @@ import { useDocsSearch } from 'fumadocs-core/search/client';
 import { oramaStaticClient } from 'fumadocs-core/search/client/orama-static';
 import { create } from '@orama/orama';
 import { useI18n } from 'fumadocs-ui/contexts/i18n';
+import { createSearchTokenizer } from '@/lib/search-tokenizer';
+
+const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? '';
 
 function initOrama() {
   return create({
     schema: { _: 'string' },
-    // https://docs.orama.com/docs/orama-js/supported-languages
-    language: 'english',
+    components: {
+      tokenizer: createSearchTokenizer(),
+    },
   });
 }
 
 export default function DefaultSearchDialog(props: SharedProps) {
-  const { locale } = useI18n(); // (optional) for i18n
+  const { locale } = useI18n();
   const { search, setSearch, query } = useDocsSearch({
     client: oramaStaticClient({
       initOrama,
       locale,
+      from: `${basePath}/api/search`,
+      search: {
+        threshold: 0,
+        tolerance: 0,
+      },
     }),
   });
 
